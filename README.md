@@ -1,10 +1,13 @@
-# deft
+<div align=center>
+<h1>deft</h1>
 
-A modern package manager and build system for **C** and **C++**, with strict
-project-layout enforcement and deep Clang integration.
+<h6>A modern package manager and build system for **C** and **C++**, with strict
+project-layout enforcement and deep Clang integration.</h6>
 
 [![Deft Version](https://img.shields.io/badge/version-0.2.0-e.svg?style=for-the-badge&labelColor=000000&color=ffffff)](https://github.com/deft-cli/deft/releases/tag/v0.2.0)
 [![Platform Support](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg?style=for-the-badge&labelColor=000000&color=ffffff)](#)
+
+</div>
 
 ## Why deft?
 
