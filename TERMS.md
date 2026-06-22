@@ -2,7 +2,7 @@
 
 **Last Updated: June 2026**
 
-Welcome to Deft. These Terms of Service ("Terms") govern your use of the Deft website and the Deft build system software (the "Software") provided under the pseudonym **xnts** ("Licensor").
+Welcome to Deft. These Terms of Service ("Terms") govern your use of the Deft website and the Deft build system software (the "Software") provided under the pseudonym **xntas** ("Licensor").
 
 ### 1. Acceptance of Terms
 By accessing this website or using the Software, you agree to be bound by these Terms and the terms of the MIT License under which the Software is distributed. If you do not agree, do not use the Software.

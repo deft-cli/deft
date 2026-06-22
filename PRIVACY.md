@@ -2,7 +2,7 @@
 
 **Last Updated: June 2026**
 
-This Privacy Policy explains how the Deft Project ("we", "us", or "our"), operated under the pseudonym **xnts**, handles information when you visit our website hosted on Cloudflare Pages and use the Deft CLI tool.
+This Privacy Policy explains how the Deft Project ("we", "us", or "our"), operated under the pseudonym **xntas**, handles information when you visit our website hosted on Cloudflare Pages and use the Deft CLI tool.
 
 ### 1. Information We Do Not Collect
 Deft is a zero-dependency, local-first build tool. 
@@ -21,4 +21,4 @@ Our website links to external source code repositories (e.g., GitHub). We are no
 As the Deft Project expands, we may introduce commercial services or paid enterprise features. If those changes require data collection, this Privacy Policy will be updated accordingly.
 
 ### 5. Contact
-If you have any questions about this policy, you can contact the project maintainer at **xnts@proton.me**.
+If you have any questions about this policy, you can contact the project maintainer at **xntas@proton.me**.
