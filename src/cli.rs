@@ -159,3 +159,76 @@ impl Cli {
         Cli::parse()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// `sync` and `update` are separate `Command` variants — parsing one
+    /// invocation resolves to exactly one of them, never both, mirroring the
+    /// fact that they touch entirely disjoint state (the global package
+    /// index vs. one project's lockfile).
+    #[test]
+    fn sync_and_update_resolve_to_distinct_variants() {
+        let sync = Cli::try_parse_from(["deft", "sync"]).expect("sync should parse");
+        match sync.command {
+            Command::Sync => {}
+            other => panic!("expected Command::Sync, got {other:?}"),
+        }
+
+        let update = Cli::try_parse_from(["deft", "update"]).expect("update should parse");
+        match update.command {
+            Command::Update(_) => {}
+            other => panic!("expected Command::Update, got {other:?}"),
+        }
+
+        // A single invocation only ever resolves one subcommand; trailing
+        // tokens that look like another subcommand are rejected as stray
+        // arguments rather than silently accepted.
+        assert!(Cli::try_parse_from(["deft", "sync", "update"]).is_err());
+    }
+
+    #[test]
+    fn update_accepts_an_optional_package_argument() {
+        let cli = Cli::try_parse_from(["deft", "update", "mylib"]).unwrap();
+        match cli.command {
+            Command::Update(args) => assert_eq!(args.package, Some("mylib".to_string())),
+            other => panic!("expected Command::Update, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["deft", "update"]).unwrap();
+        match cli.command {
+            Command::Update(args) => assert_eq!(args.package, None),
+            other => panic!("expected Command::Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_takes_no_positional_arguments() {
+        assert!(Cli::try_parse_from(["deft", "sync", "extra"]).is_err());
+    }
+
+    /// The two variants also carry distinct, doc-comment-derived help text —
+    /// the structural separation in `Command` is documented, not just an
+    /// implementation detail invisible to `--help`.
+    #[test]
+    fn sync_and_update_have_distinct_help_text() {
+        let cmd = Cli::command();
+
+        let sync_about = cmd
+            .find_subcommand("sync")
+            .and_then(|c| c.get_about())
+            .map(|s| s.to_string())
+            .expect("sync subcommand should document itself");
+        let update_about = cmd
+            .find_subcommand("update")
+            .and_then(|c| c.get_about())
+            .map(|s| s.to_string())
+            .expect("update subcommand should document itself");
+
+        assert_ne!(sync_about, update_about);
+        assert!(sync_about.to_lowercase().contains("index"));
+        assert!(update_about.to_lowercase().contains("lock"));
+    }
+}

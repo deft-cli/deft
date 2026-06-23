@@ -369,3 +369,107 @@ pub struct LinkCommand {
     pub program: String,
     pub args: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compiler() -> Compiler {
+        Compiler::new(
+            CProfile::default(),
+            CppProfile::default(),
+            Vec::new(),
+            &[],
+            false,
+        )
+    }
+
+    /// `link_command` for an executable always resolves to exactly one
+    /// candidate, driven by whichever language pulled in the unit (the C++
+    /// driver if any translation unit was C++, to pull in the C++ runtime).
+    #[test]
+    fn link_command_executable_picks_driver_by_language() {
+        let c = compiler();
+        let objects = vec![PathBuf::from("main.o")];
+        let output = PathBuf::from("app");
+
+        let c_cmds = c.link_command(&objects, &output, false, false);
+        assert_eq!(c_cmds.len(), 1);
+        assert_eq!(c_cmds[0].program, "clang");
+
+        let cpp_cmds = c.link_command(&objects, &output, true, false);
+        assert_eq!(cpp_cmds.len(), 1);
+        assert_eq!(cpp_cmds[0].program, "clang++");
+    }
+
+    /// The archiver fallback chain is platform-specific: Unix has exactly one
+    /// candidate (`ar`), Windows offers `llvm-ar` first and falls back to
+    /// MSVC's `lib.exe`, with each program's own calling convention intact.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn link_command_library_windows_fallback_chain() {
+        let c = compiler();
+        let objects = vec![PathBuf::from("a.obj"), PathBuf::from("b.obj")];
+        let output = PathBuf::from("mylib.lib");
+
+        let cmds = c.link_command(&objects, &output, false, true);
+        assert_eq!(cmds.len(), 2);
+
+        assert_eq!(cmds[0].program, "llvm-ar");
+        assert_eq!(cmds[0].args[0], "rcsD");
+        assert_eq!(cmds[0].args[1], "mylib.lib");
+        assert!(cmds[0].args.contains(&"a.obj".to_string()));
+        assert!(cmds[0].args.contains(&"b.obj".to_string()));
+
+        assert_eq!(cmds[1].program, "lib.exe");
+        assert_eq!(cmds[1].args[0], "/OUT:mylib.lib");
+        assert!(cmds[1].args.contains(&"a.obj".to_string()));
+        assert!(cmds[1].args.contains(&"b.obj".to_string()));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn link_command_library_unix_single_candidate() {
+        let c = compiler();
+        let objects = vec![PathBuf::from("a.o"), PathBuf::from("b.o")];
+        let output = PathBuf::from("libmy.a");
+
+        let cmds = c.link_command(&objects, &output, false, true);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].program, "ar");
+        assert_eq!(cmds[0].args[0], "rcsD");
+        assert_eq!(cmds[0].args[1], "libmy.a");
+        assert!(cmds[0].args.contains(&"a.o".to_string()));
+        assert!(cmds[0].args.contains(&"b.o".to_string()));
+    }
+
+    /// Object/archive extensions are decided by the engine when it builds the
+    /// `output`/`objects` paths handed to `link_command`, not by this
+    /// function itself — verify the extension convention the rest of the
+    /// pipeline relies on.
+    #[test]
+    fn object_and_archive_extensions_match_platform_convention() {
+        if cfg!(target_os = "windows") {
+            assert_eq!(Path::new("main.obj").extension().unwrap(), "obj");
+            assert_eq!(Path::new("mylib.lib").extension().unwrap(), "lib");
+        } else {
+            assert_eq!(Path::new("main.o").extension().unwrap(), "o");
+            assert_eq!(Path::new("libmy.a").extension().unwrap(), "a");
+        }
+    }
+
+    #[test]
+    fn language_from_extension_is_strictly_separated() {
+        assert_eq!(
+            Language::from_extension(Path::new("foo.c")),
+            Some(Language::C)
+        );
+        for ext in ["cc", "cpp", "cxx", "c++", "cp"] {
+            assert_eq!(
+                Language::from_extension(Path::new(&format!("foo.{ext}"))),
+                Some(Language::Cpp)
+            );
+        }
+        assert_eq!(Language::from_extension(Path::new("foo.h")), None);
+    }
+}

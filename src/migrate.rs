@@ -354,3 +354,87 @@ fn parse_cmake(raw: &str) -> CMakeProject {
 
     project
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mock mixed-language `add_executable` call: 3 C++ sources vs. 2 C
+    /// sources. C++ must win the majority, the 2 C files must be quarantined
+    /// into `conflicting_sources`, and parsing must complete without
+    /// panicking.
+    const MIXED_LANGUAGE_CMAKE: &str = r#"
+        project(widgets)
+        add_executable(widgets main.cpp foo.c bar.cpp baz.c qux.cpp)
+        target_include_directories(widgets PUBLIC include)
+        target_link_libraries(widgets pthread)
+    "#;
+
+    #[test]
+    fn dominant_language_picked_by_majority_source_count() {
+        let project = parse_cmake(MIXED_LANGUAGE_CMAKE);
+
+        // 3 C++ vs. 2 C: C++ is dominant, so `is_c` must be false.
+        assert!(!project.is_c);
+        assert_eq!(project.sources.len(), 3);
+        assert_eq!(project.conflicting_sources.len(), 2);
+
+        for s in &project.sources {
+            assert!(is_cpp_source(s), "expected dominant cpp source, got {s}");
+        }
+        for s in &project.conflicting_sources {
+            assert!(
+                !is_cpp_source(s),
+                "expected minority c source, got {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn minority_sources_become_a_todo_comment_block() {
+        let project = parse_cmake(MIXED_LANGUAGE_CMAKE);
+        let manifest = project.render_manifest();
+
+        assert!(manifest.contains("# TODO: Manually resolve mixed-language translation units"));
+        for s in &project.conflicting_sources {
+            assert!(
+                manifest.contains(&format!("#   - {s}")),
+                "manifest missing TODO line for {s}:\n{manifest}"
+            );
+        }
+        // The dominant profile (C++) must be the one actually emitted.
+        assert!(manifest.contains("[profile.cpp]"));
+        assert!(!manifest.contains("[profile.c]"));
+    }
+
+    #[test]
+    fn single_language_project_has_no_conflicting_sources() {
+        let text = r#"
+            project(tool)
+            add_executable(tool main.c util.c)
+        "#;
+        let project = parse_cmake(text);
+
+        assert!(project.is_c);
+        assert_eq!(project.sources.len(), 2);
+        assert!(project.conflicting_sources.is_empty());
+
+        let manifest = project.render_manifest();
+        assert!(!manifest.contains("# TODO: Manually resolve mixed-language translation units"));
+    }
+
+    /// Reporting helpers must never panic, mixed-language or not — this is
+    /// the migration tool's "never crash, always tell the user" guarantee.
+    #[test]
+    fn reporting_helpers_do_not_panic_on_mixed_or_clean_input() {
+        let mixed = parse_cmake(MIXED_LANGUAGE_CMAKE);
+        mixed.print_notices();
+        mixed.print_unmapped_warning();
+        let _ = mixed.render_manifest();
+
+        let clean = parse_cmake("project(empty)");
+        clean.print_notices();
+        clean.print_unmapped_warning();
+        let _ = clean.render_manifest();
+    }
+}
