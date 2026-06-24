@@ -15,7 +15,7 @@ C and C++ tooling is fragmented. `deft` brings a familiar, manifest-driven
 package-manager workflow while staying dependency-free itself — it shells out
 to tools your system already has (`clang`, `git`, `curl`/`wget`/PowerShell,
 `ar`/`llvm-ar`/`lib.exe`) instead of bundling an HTTP client, VCS library, or
-archiver crate. See [docs/architecture.md](docs/architecture.md) for the full
+archiver crate. See [docs/guides/architecture.md](docs/guides/architecture.md) for the full
 rationale.
 
 - **Strict project layout.** No globbing, no guessing. The entry point is
@@ -37,7 +37,7 @@ rationale.
   into clean, colorized terminal alerts.
 - **Cross-platform static linking.** Archiving tries `ar` (Unix) or
   `llvm-ar` then `lib.exe` (Windows), falling through only when a tool is
-  genuinely missing — see [docs/architecture.md](docs/architecture.md).
+  genuinely missing — see [docs/guides/architecture.md](docs/guides/architecture.md).
 
 ## Installation
 
@@ -70,7 +70,7 @@ Common flags: `--release`, `-o <name>`, `-j <N>`, `--features a,b`,
 
 Full flag-by-flag mechanics (what `--release` actually overrides, how
 `-j` is clamped, how `[-- ARGS...]` forwarding works, etc.) are documented in
-[docs/cli.md](docs/cli.md).
+[docs/guides/cli.md](docs/guides/cli.md).
 
 ## Quick start
 
