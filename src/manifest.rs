@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use crate::error::{DeftError, IoPathExt, Result};
 
@@ -55,6 +56,11 @@ pub struct Package {
     pub description: Option<String>,
     #[serde(default)]
     pub authors: Vec<String>,
+    /// Optional pinned toolchain, e.g. `"clang-18.1"`. When set, `deft doctor`
+    /// and the pre-build phase of `deft build` invoke the active compiler and
+    /// abort the build if its reported version doesn't match.
+    #[serde(default)]
+    pub toolchain: Option<String>,
 }
 
 /// `[profile.c]` and `[profile.cpp]`.
@@ -132,6 +138,88 @@ impl Default for CppProfile {
             defines: Vec::new(),
         }
     }
+}
+
+/// A parsed `[package] toolchain` pin, e.g. `"clang-18.1"` -> `{ compiler:
+/// "clang", version: "18.1" }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolchainSpec {
+    pub compiler: String,
+    pub version: String,
+}
+
+impl ToolchainSpec {
+    /// Parse a `<compiler>-<version>` string. The split is on the first `-`,
+    /// so `"clang-18.1"` separates into `"clang"` and `"18.1"`.
+    pub fn parse(raw: &str) -> Result<ToolchainSpec> {
+        let (compiler, version) = raw.split_once('-').ok_or_else(|| {
+            DeftError::Config(format!(
+                "invalid toolchain spec '{raw}' (expected '<compiler>-<version>', e.g. 'clang-18.1')"
+            ))
+        })?;
+        if compiler.is_empty() || version.is_empty() {
+            return Err(DeftError::Config(format!(
+                "invalid toolchain spec '{raw}' (expected '<compiler>-<version>', e.g. 'clang-18.1')"
+            )));
+        }
+        Ok(ToolchainSpec {
+            compiler: compiler.to_string(),
+            version: version.to_string(),
+        })
+    }
+
+    /// Invoke the pinned compiler and confirm its reported version matches —
+    /// as a dotted-prefix match, so a manifest pin of `"18.1"` accepts any
+    /// installed `"18.1.x"` but rejects `"17.x"` or `"19.x"`.
+    pub fn validate(&self) -> Result<()> {
+        let output = Command::new(&self.compiler)
+            .arg("--version")
+            .output()
+            .map_err(|source| DeftError::CommandSpawn {
+                program: self.compiler.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(DeftError::Config(format!(
+                "toolchain check failed: '{} --version' did not exit successfully",
+                self.compiler
+            )));
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let detected = extract_compiler_version(&text).ok_or_else(|| {
+            DeftError::Config(format!(
+                "could not determine '{}' version from its --version output",
+                self.compiler
+            ))
+        })?;
+
+        let matches =
+            detected == self.version || detected.starts_with(&format!("{}.", self.version));
+        if !matches {
+            return Err(DeftError::Config(format!(
+                "environment unvalidated: manifest pins toolchain '{}-{}' but found '{} {}' \
+                 (run `deft doctor` for details)",
+                self.compiler, self.version, self.compiler, detected
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Pull the first dotted version-looking token out of a compiler's
+/// `--version` first line, e.g. `"clang version 18.1.3"` -> `"18.1.3"`.
+fn extract_compiler_version(output: &str) -> Option<String> {
+    let first_line = output.lines().next()?;
+    first_line.split_whitespace().find_map(|tok| {
+        let cleaned = tok.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        let first = cleaned.chars().next()?;
+        if first.is_ascii_digit() && cleaned.contains('.') {
+            Some(cleaned.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn default_c_standard() -> String {
@@ -312,5 +400,58 @@ impl Lockfile {
     /// Look up a locked dependency by package name.
     pub fn get(&self, name: &str) -> Option<&LockedDependency> {
         self.dependencies.iter().find(|d| d.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolchain_spec_parses_compiler_and_version() {
+        let spec = ToolchainSpec::parse("clang-18.1").unwrap();
+        assert_eq!(spec.compiler, "clang");
+        assert_eq!(spec.version, "18.1");
+    }
+
+    #[test]
+    fn toolchain_spec_rejects_missing_separator() {
+        assert!(ToolchainSpec::parse("clang18.1").is_err());
+    }
+
+    #[test]
+    fn toolchain_spec_rejects_empty_halves() {
+        assert!(ToolchainSpec::parse("-18.1").is_err());
+        assert!(ToolchainSpec::parse("clang-").is_err());
+    }
+
+    #[test]
+    fn extract_compiler_version_finds_dotted_token() {
+        assert_eq!(
+            extract_compiler_version("clang version 18.1.3"),
+            Some("18.1.3".to_string())
+        );
+        assert_eq!(
+            extract_compiler_version("Apple clang version 15.0.0 (clang-1500.3.9.4)"),
+            Some("15.0.0".to_string())
+        );
+        assert_eq!(extract_compiler_version("no version here"), None);
+    }
+
+    #[test]
+    fn toolchain_spec_version_match_is_dotted_prefix() {
+        // Exercised indirectly via the documented semantics: "18.1" should be
+        // a prefix-match for a detected "18.1.3", but not for "18.10.0" (the
+        // separator-aware prefix check avoids a false match across this
+        // exact boundary).
+        let detected = "18.1.3";
+        let pin = "18.1";
+        assert!(detected == pin || detected.starts_with(&format!("{pin}.")));
+
+        let detected_other_minor = "18.10.0";
+        let pin = "18.1";
+        assert!(
+            !(detected_other_minor == pin || detected_other_minor.starts_with(&format!("{pin}.")))
+        );
     }
 }

@@ -468,7 +468,11 @@ pub fn package_name(shorthand: &str) -> String {
 }
 
 /// Resolve `~/.deft`, honoring `$DEFT_HOME` then `$HOME`.
-fn deft_home() -> Result<PathBuf> {
+///
+/// `pub(crate)` because the global build cache (`hash.rs`) needs the same
+/// resolution rule — there is exactly one definition of "where is deft's
+/// home directory" in the codebase.
+pub(crate) fn deft_home() -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var("DEFT_HOME") {
         if !explicit.is_empty() {
             return Ok(PathBuf::from(explicit));

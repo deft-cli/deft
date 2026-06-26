@@ -16,8 +16,10 @@ use std::thread;
 use std::time::Instant;
 
 use crate::compiler::{CompileUnit, Compiler, Language, LinkCommand};
-use crate::error::{DeftError, IoPathExt, Result};
+use crate::error::{CompileDiagnostic, DeftError, IoPathExt, Result};
+use crate::hash;
 use crate::manifest::{Manifest, Package};
+use crate::resolver;
 
 /// What kind of artifact a package produces, decided by which entry file the
 /// strict layout contains.
@@ -159,24 +161,40 @@ struct UnitResult {
     raw_stderr: String,
 }
 
+/// The artifact produced by [`Engine::build_package`], plus whether it came
+/// from the global build cache instead of a fresh compile.
+pub struct BuiltArtifact {
+    pub path: PathBuf,
+    pub cache_hit: bool,
+}
+
 /// Top-level build orchestrator.
 pub struct Engine {
     jobs: usize,
     verbose: bool,
     quiet: bool,
+    /// When true, suppress human-readable progress/diagnostic text — the
+    /// caller is rendering a single structured `--json` payload instead.
+    json: bool,
 }
 
 impl Engine {
-    pub fn new(jobs: usize, verbose: bool, quiet: bool) -> Engine {
+    pub fn new(jobs: usize, verbose: bool, quiet: bool, json: bool) -> Engine {
         let jobs = jobs.max(1);
         Engine {
             jobs,
             verbose,
             quiet,
+            json,
         }
     }
 
-    /// Compile and link a package. Returns the path to the produced artifact.
+    /// Compile and link a package. Returns the produced artifact's path and
+    /// whether it was served from the global build cache.
+    ///
+    /// Only library artifacts (static archives) participate in the global
+    /// cache — see docs/guides/architecture.md for why executables, whose
+    /// output is project-specific, are out of scope for it.
     pub fn build_package(
         &self,
         layout: &Layout,
@@ -185,7 +203,7 @@ impl Engine {
         target_dir: &Path,
         output_name: Option<&str>,
         release: bool,
-    ) -> Result<PathBuf> {
+    ) -> Result<BuiltArtifact> {
         compiler.validate()?;
 
         let profile_dir = target_dir.join(if release { "release" } else { "debug" });
@@ -198,6 +216,40 @@ impl Engine {
                 "package '{}' has no source files under src/",
                 package.name
             )));
+        }
+
+        let artifact = artifact_path(&profile_dir, layout.crate_kind, &package.name, output_name);
+
+        // --- Global cache short-circuit ---------------------------------
+        // Before spinning up the compile thread-pool, see whether a
+        // byte-identical build (same sources, same flags, same target) has
+        // already been cached globally under ~/.deft/cache/prebuilt/{hash}.
+        let cache_key = if layout.crate_kind == Crate::Library {
+            let fingerprint = compiler.cache_fingerprint(layout.entry_language)?;
+            Some(hash::package_key(&sources, &fingerprint)?)
+        } else {
+            None
+        };
+
+        if let Some(key) = &cache_key {
+            if let Ok(home) = resolver::deft_home() {
+                if let Some(cached) = hash::lookup(&home, key, &package.name) {
+                    if let Some(parent) = artifact.parent() {
+                        fs::create_dir_all(parent).path_ctx(parent)?;
+                    }
+                    fs::copy(&cached, &artifact).path_ctx(&artifact)?;
+                    if !self.quiet {
+                        println!(
+                            "\x1b[1;32m  Cache hit\x1b[0m {} v{} [{}]",
+                            package.name, package.version, key
+                        );
+                    }
+                    return Ok(BuiltArtifact {
+                        path: artifact,
+                        cache_hit: true,
+                    });
+                }
+            }
         }
 
         // Plan every translation unit.
@@ -236,28 +288,6 @@ impl Engine {
             );
         }
 
-        // Determine artifact path. Naming is platform-specific: Windows wants
-        // `name.exe` / `name.lib`, Unix wants bare `name` / `libname.a`.
-        let artifact = match layout.crate_kind {
-            Crate::Executable => {
-                let name = output_name.unwrap_or(&package.name);
-                let filename = if cfg!(target_os = "windows") {
-                    format!("{name}.exe")
-                } else {
-                    name.to_string()
-                };
-                profile_dir.join(filename)
-            }
-            Crate::Library => {
-                let name = output_name.unwrap_or(&package.name);
-                let filename = if cfg!(target_os = "windows") {
-                    format!("{name}.lib")
-                } else {
-                    format!("lib{name}.a")
-                };
-                profile_dir.join(filename)
-            }
-        };
         if let Some(parent) = artifact.parent() {
             fs::create_dir_all(parent).path_ctx(parent)?;
         }
@@ -287,7 +317,19 @@ impl Engine {
             );
         }
 
-        Ok(artifact)
+        // Populate the global cache for next time. Best-effort: a cache
+        // write failure (e.g. an unwritable ~/.deft) must never fail an
+        // otherwise-successful build.
+        if let Some(key) = &cache_key {
+            if let Ok(home) = resolver::deft_home() {
+                let _ = hash::store(&home, key, &package.name, &artifact);
+            }
+        }
+
+        Ok(BuiltArtifact {
+            path: artifact,
+            cache_hit: false,
+        })
     }
 
     /// Run all compile units across a fixed-size thread pool.
@@ -332,11 +374,13 @@ impl Engine {
         // Collect results as they arrive.
         let mut failures = 0usize;
         let mut completed = 0usize;
+        let mut failed_diagnostics: Vec<CompileDiagnostic> = Vec::new();
         for result in rx {
             completed += 1;
             self.report_unit(&result, completed, total);
             if !result.success {
                 failures += 1;
+                collect_failure_diagnostics(&result, &mut failed_diagnostics);
             }
         }
 
@@ -346,13 +390,21 @@ impl Engine {
         }
 
         if failures > 0 {
-            return Err(DeftError::Compilation { failures });
+            return Err(DeftError::Compilation {
+                failures,
+                diagnostics: failed_diagnostics,
+            });
         }
         Ok(objects)
     }
 
-    /// Print diagnostics for a finished unit.
+    /// Print diagnostics for a finished unit. A no-op in `--json` mode — the
+    /// caller renders diagnostics from the returned `DeftError::Compilation`
+    /// (or the success payload) as a single structured object instead.
     fn report_unit(&self, result: &UnitResult, idx: usize, total: usize) {
+        if self.json {
+            return;
+        }
         if result.success {
             if self.verbose {
                 eprintln!(
@@ -455,9 +507,46 @@ impl Engine {
 
         // Unreachable in practice — `link_command` never returns an empty
         // candidate list — but keeps the function total rather than panicking.
-        Err(last_spawn_err.unwrap_or_else(|| {
-            DeftError::Config("no archiver/linker candidates available".into())
-        }))
+        Err(last_spawn_err
+            .unwrap_or_else(|| DeftError::Config("no archiver/linker candidates available".into())))
+    }
+}
+
+/// Fold one failed unit's diagnostics into the running list carried by
+/// `DeftError::Compilation`. Prefers parsed `Error`-severity diagnostics;
+/// falls back to a single synthetic entry built from raw stderr (or a
+/// generic message) when clang's output couldn't be parsed at all.
+fn collect_failure_diagnostics(result: &UnitResult, out: &mut Vec<CompileDiagnostic>) {
+    let errors: Vec<&Diagnostic> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
+
+    if errors.is_empty() {
+        let message = if result.raw_stderr.trim().is_empty() {
+            "compilation failed with no diagnostic output".to_string()
+        } else {
+            result.raw_stderr.trim().to_string()
+        };
+        out.push(CompileDiagnostic {
+            file: result.source.clone(),
+            line: 0,
+            column: 0,
+            severity: "error",
+            message,
+        });
+        return;
+    }
+
+    for d in errors {
+        out.push(CompileDiagnostic {
+            file: d.file.clone(),
+            line: d.line,
+            column: d.column,
+            severity: "error",
+            message: d.message.clone(),
+        });
     }
 }
 
@@ -681,6 +770,35 @@ fn parse_header_line(line: &str) -> Option<Diagnostic> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Compute the artifact path for a package. Naming is platform-specific:
+/// Windows wants `name.exe` / `name.lib`, Unix wants bare `name` /
+/// `libname.a`.
+fn artifact_path(
+    profile_dir: &Path,
+    kind: Crate,
+    package_name: &str,
+    output_name: Option<&str>,
+) -> PathBuf {
+    let name = output_name.unwrap_or(package_name);
+    let filename = match kind {
+        Crate::Executable => {
+            if cfg!(target_os = "windows") {
+                format!("{name}.exe")
+            } else {
+                name.to_string()
+            }
+        }
+        Crate::Library => {
+            if cfg!(target_os = "windows") {
+                format!("{name}.lib")
+            } else {
+                format!("lib{name}.a")
+            }
+        }
+    };
+    profile_dir.join(filename)
+}
+
 /// Compute the object-file path for a source, mirroring its path under `src/`
 /// to avoid collisions between same-named files in different directories.
 fn object_path(obj_dir: &Path, layout: &Layout, source: &Path) -> PathBuf {
@@ -693,11 +811,19 @@ fn object_path(obj_dir: &Path, layout: &Layout, source: &Path) -> PathBuf {
 
 /// `.obj` on Windows (MSVC/llvm-ar/lib.exe convention), `.o` everywhere else.
 fn object_extension() -> &'static str {
-    if cfg!(target_os = "windows") { "obj" } else { "o" }
+    if cfg!(target_os = "windows") {
+        "obj"
+    } else {
+        "o"
+    }
 }
 
 fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 /// Determine a sensible default parallelism when `-j` is not provided.
@@ -716,4 +842,166 @@ pub fn require_package(manifest: &Manifest, root: &Path) -> Result<Package> {
             path: root.join("deft.toml"),
             message: "missing [package] table (name/version required to build)".to_string(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::Compiler;
+    use crate::manifest::{CProfile, CppProfile};
+    use std::sync::Mutex;
+
+    /// Env vars are process-global; serialize the one test below that
+    /// mutates `DEFT_HOME` so it can't race with itself across reruns.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn make_library_package(dir: &Path, name: &str) -> (Layout, Package) {
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.c"),
+            "int deft_add(int a, int b) { return a + b; }\n",
+        )
+        .unwrap();
+        let layout = Layout::discover(dir).unwrap();
+        let package = Package {
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            authors: Vec::new(),
+            toolchain: None,
+        };
+        (layout, package)
+    }
+
+    /// End-to-end: a fresh library build must populate
+    /// `~/.deft/cache/prebuilt/{hash}`, and an identical second build (even
+    /// after the local `target/` is wiped) must be served from that cache
+    /// instead of invoking the compiler again.
+    #[test]
+    fn build_package_populates_and_then_hits_the_global_cache() {
+        if Command::new("clang").arg("--version").output().is_err() {
+            eprintln!("skipping: clang not available in this environment");
+            return;
+        }
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let pid = std::process::id();
+        let project = std::env::temp_dir().join(format!("deft-engine-cache-test-{pid}"));
+        let home = std::env::temp_dir().join(format!("deft-engine-cache-home-{pid}"));
+        let _ = fs::remove_dir_all(&project);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&project).unwrap();
+
+        let prev_home = std::env::var("DEFT_HOME").ok();
+        std::env::set_var("DEFT_HOME", &home);
+
+        let (layout, package) = make_library_package(&project, "cachelib");
+        let compiler = Compiler::new(
+            CProfile::default(),
+            CppProfile::default(),
+            Vec::new(),
+            &[],
+            false,
+        );
+        let engine = Engine::new(1, false, true, false);
+        let target_dir = project.join("target");
+
+        let first = engine
+            .build_package(&layout, &package, &compiler, &target_dir, None, false)
+            .unwrap();
+        assert!(
+            !first.cache_hit,
+            "first build should compile, not hit the cache"
+        );
+
+        // Wipe the local target dir so the second build can only succeed by
+        // copying from the *global* cache, not by reusing a local leftover.
+        fs::remove_dir_all(&target_dir).unwrap();
+
+        let second = engine
+            .build_package(&layout, &package, &compiler, &target_dir, None, false)
+            .unwrap();
+        assert!(
+            second.cache_hit,
+            "second build with identical inputs should hit the global cache"
+        );
+        assert!(second.path.is_file());
+
+        match prev_home {
+            Some(v) => std::env::set_var("DEFT_HOME", v),
+            None => std::env::remove_var("DEFT_HOME"),
+        }
+        let _ = fs::remove_dir_all(&project);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn collect_failure_diagnostics_falls_back_to_raw_stderr_when_unparsed() {
+        let result = UnitResult {
+            source: PathBuf::from("src/main.c"),
+            success: false,
+            diagnostics: Vec::new(),
+            raw_stderr: "some opaque linker-style failure".to_string(),
+        };
+        let mut out = Vec::new();
+        collect_failure_diagnostics(&result, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, "error");
+        assert!(out[0].message.contains("opaque linker-style failure"));
+    }
+
+    #[test]
+    fn collect_failure_diagnostics_prefers_parsed_error_severity() {
+        let result = UnitResult {
+            source: PathBuf::from("src/main.c"),
+            success: false,
+            diagnostics: vec![
+                Diagnostic {
+                    severity: Severity::Warning,
+                    file: PathBuf::from("src/main.c"),
+                    line: 1,
+                    column: 1,
+                    message: "unused variable".into(),
+                    code: None,
+                    snippet: None,
+                },
+                Diagnostic {
+                    severity: Severity::Error,
+                    file: PathBuf::from("src/main.c"),
+                    line: 2,
+                    column: 3,
+                    message: "undeclared identifier".into(),
+                    code: None,
+                    snippet: None,
+                },
+            ],
+            raw_stderr: String::new(),
+        };
+        let mut out = Vec::new();
+        collect_failure_diagnostics(&result, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line, 2);
+        assert_eq!(out[0].message, "undeclared identifier");
+    }
+
+    #[test]
+    fn artifact_path_matches_platform_convention() {
+        let dir = PathBuf::from("/tmp/profile");
+        let exe = artifact_path(&dir, Crate::Executable, "app", None);
+        let lib = artifact_path(&dir, Crate::Library, "mylib", None);
+        if cfg!(target_os = "windows") {
+            assert_eq!(exe.file_name().unwrap(), "app.exe");
+            assert_eq!(lib.file_name().unwrap(), "mylib.lib");
+        } else {
+            assert_eq!(exe.file_name().unwrap(), "app");
+            assert_eq!(lib.file_name().unwrap(), "libmylib.a");
+        }
+        let overridden = artifact_path(&dir, Crate::Library, "mylib", Some("custom"));
+        assert!(overridden
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("custom"));
+    }
 }

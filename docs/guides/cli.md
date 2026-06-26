@@ -45,6 +45,17 @@ Both flags are parsed once at the top of `main()` and threaded explicitly
 through every command handler as `(verbose: bool, quiet: bool)` parameters —
 there is no global/thread-local state.
 
+- **`--json`.** Also `global = true`, so it parses before or after any
+  subcommand. Only `deft build` and `deft doctor` currently act on it; other
+  commands accept the flag without erroring but ignore it. When set, the
+  command's entire human-readable output (the `Compiling`/`Linking`/`Finished`
+  progress lines, the `doctor` table, etc.) is replaced by exactly one
+  compact JSON object printed to stdout — see [`--json` Output](#--json-output)
+  below for the payload shapes. Implemented with a small dependency-free
+  encoder, [json.rs](../src/json.rs), rather than `serde_json`, to keep
+  deft's three-dependency footprint unchanged (see
+  [architecture.md](architecture.md)).
+
 ## Command Matrix
 
 ### `deft build`
@@ -62,6 +73,23 @@ deft build [--release] [-o NAME] [-j N] [--manifest-path DIR]
 | `--manifest-path DIR` | `Option<PathBuf>`. May point at a directory or directly at a `deft.toml` file (`project_root` strips the filename in the latter case). Defaults to the current working directory. Resolution fails fast with `LayoutViolation` if no `deft.toml` is found at the resolved root. |
 | `--features A,B,C` | `Vec<String>`, comma-delimited (`value_delimiter = ','`). Unioned with the manifest's `default` feature set (unless suppressed) and transitively expanded — see [manifest.md](manifest.md#feature-flag-resolution). |
 | `--no-default-features` | Boolean. Suppresses automatic inclusion of the `[features] default` set; explicitly-passed `--features` are still honored. |
+
+**Toolchain pin.** If `[package] toolchain` is set (e.g. `"clang-18.1"`),
+`build_single` validates it — invoking the named compiler and checking its
+reported version — immediately after loading the manifest's `[package]`
+table, before dependency resolution or any compilation. A mismatch aborts
+the build with a descriptive error. See
+[manifest.md](manifest.md#toolchain--pinning-the-active-compiler) for the
+parsing/matching rules. Unset by default, so this costs nothing for projects
+that don't opt in.
+
+**Offline/vendored dependency resolution.** Before reaching for the
+resolver at all, `build_single` checks whether `<root>/third_party/` exists
+and has at least one entry. If so, dependencies are resolved entirely from
+those local copies plus `deft.lock` metadata — no `git`, no network, no
+global resolver cache lookups (`vendored_dependencies` in
+[main.rs](../src/main.rs)). See [`deft vendor`](#deft-vendor) below for how
+that directory gets populated.
 
 **Profile mapping.** `build_single` loads `manifest.profile.c` /
 `manifest.profile.cpp` (each `Option<CProfile>`/`Option<CppProfile>`,
@@ -84,6 +112,23 @@ otherwise resolve to an executable (`Layout { crate_kind: Crate::Library,
 ..dep_layout }` forcibly overrides the kind) — before the root package, so
 their archives and `src/`/`include/` headers exist as `-I` include paths by
 the time the root package's units are planned.
+
+**Global build cache.** Before compiling any *library* package (the root
+package when its entry is `src/lib.*`, and every dependency, which is always
+built as a library — see above), `Engine::build_package` ([engine.rs](../src/engine.rs))
+computes a deterministic cache key over the package's sources (path, content,
+and mtime of each) and its resolved compiler flag fingerprint (standard,
+optimization, warnings, defines — everything except source/object paths, so
+the key is portable across checkouts), plus the target OS/arch
+(`hash::package_key`, [hash.rs](../src/hash.rs)). If a static archive already
+exists at `~/.deft/cache/prebuilt/{key}/lib{name}.a` (`.lib` on Windows), the
+thread-pool is never spun up at all: the cached archive is copied straight
+into the project's local `target/{debug,release}/` and a `Cache hit` line is
+logged. A successful fresh build populates that same cache entry afterward
+(best-effort — a write failure there never fails the build). Executables are
+out of scope for this cache, since their output is project-specific rather
+than a reusable artifact. Hashing uses only `std::hash::Hasher`
+(`DefaultHasher`) — no extra crate.
 
 ### `deft run`
 
@@ -315,3 +360,82 @@ touches `deft.lock`) and complementary to `deft build` (which, by design,
   followed by one `name vVERSION @ <10-char SHA prefix>` line per resolved
   dependency (`short_sha` truncates to the first 10 characters, or the full
   string if shorter).
+
+### `deft vendor`
+
+```
+deft vendor [--manifest-path DIR]
+```
+
+Copies every dependency recorded in `deft.lock` into a local
+`<root>/third_party/<name>/` tree, for complete offline autonomy — once that
+directory is populated, every subsequent `deft build` resolves dependencies
+from it directly (see [Offline/vendored dependency
+resolution](#deft-build) above), with no `git`, no network, and no global
+`~/.deft/cache` lookups at all.
+
+`cmd_vendor` ([main.rs](../src/main.rs)):
+
+1. Requires an existing `deft.lock` (`deft build` or `deft update` must have
+   run at least once) — refuses with `DeftError::Config` otherwise, rather
+   than silently re-resolving.
+2. Resolves dependencies via `Resolver::resolve_all(&manifest, Some(&lock))`
+   — the same *pinned* path `deft build` takes, so vendoring never drifts
+   from what's actually locked.
+3. For each resolved dependency, recursively copies its global-cache
+   checkout (`dep.cache_path`) into `third_party/<name>/`, skipping any
+   `.git` directory (`copy_tree_excluding_git`) — the vendored copy is a
+   source snapshot, not a live git checkout. Any pre-existing
+   `third_party/<name>/` is removed first, so re-running `deft vendor` is
+   idempotent.
+4. Non-quiet output prints one `Vendored <name> vVERSION -> <path>` line per
+   dependency, then a `Finished vendoring N dependenc{y,ies}` summary.
+
+### `--json` Output
+
+`--json` (declared `global = true` on `Cli`, see [Global
+Constraints](#global-constraints)) replaces a command's human-readable
+output with one compact JSON object on stdout. Implemented by
+[json.rs](../src/json.rs) — a closed, dependency-free `Json` enum
+(`Null`/`Bool`/`Number`/`String`/`Array`/`Object`) with a `render()` method,
+rather than pulling in `serde_json`.
+
+**`deft build --json`.** `cmd_build_top_level` ([main.rs](../src/main.rs))
+times the whole build, forces `quiet`/`json` through to every internal
+`println!`/diagnostic-print call site (so no interim text reaches stdout —
+see `Engine`'s `json` field in [engine.rs](../src/engine.rs)), and renders
+exactly one of:
+
+```json
+{"status":"success","duration_ms":842,"cache_hits":2,"artifact":"target/debug/app","errors":[]}
+```
+
+```json
+{"status":"failure","duration_ms":210,"cache_hits":0,"errors":[
+  {"file":"src/main.c","line":4,"column":2,"severity":"error","message":"undeclared identifier 'foo'"}
+]}
+```
+
+`cache_hits` sums every library package (dependencies, plus the root package
+itself if it's a library) served from the global build cache instead of
+recompiled — see the [Global build cache](#deft-build) section above.
+`errors` carries the structured `CompileDiagnostic`s attached to
+`DeftError::Compilation` when the failure came from the compiler; for any
+other error kind (a layout violation, a missing manifest, a toolchain
+mismatch, ...) it falls back to one synthetic entry built from the error's
+`Display` text, with `file: null`.
+
+**`deft doctor --json`.** `doctor::run` ([doctor.rs](../src/doctor.rs)) runs
+the exact same checks as the human-readable report (see [`deft
+doctor`](#deft-doctor) above, including the conditional `toolchain` check)
+and renders:
+
+```json
+{"checks":[
+  {"name":"clang","ok":true,"detail":"clang version 18.1.3","fix":null},
+  {"name":"ar","ok":false,"detail":"not found on PATH ...","fix":"install binutils: ..."}
+],"passed":1,"failed":1}
+```
+
+Every check always carries all four keys — `fix` is JSON `null`, never an
+omitted key, when a check passed and has nothing to fix.

@@ -9,33 +9,39 @@ mod compiler;
 mod doctor;
 mod engine;
 mod error;
+mod hash;
+mod json;
 mod manifest;
 mod migrate;
 mod resolver;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
-use cli::{BuildArgs, Cli, Command as Cmd, InitArgs, RunArgs, UpdateArgs};
+use cli::{BuildArgs, Cli, Command as Cmd, InitArgs, RunArgs, UpdateArgs, VendorArgs};
 use compiler::Compiler;
-use engine::{Crate, Engine, Layout, default_jobs, require_package};
+use engine::{default_jobs, require_package, Crate, Engine, Layout};
 use error::{DeftError, IoPathExt, Result};
-use manifest::{Lockfile, Manifest};
-use resolver::{ResolvedDep, Resolver, build_lockfile, package_name};
+use json::Json;
+use manifest::{Lockfile, Manifest, ToolchainSpec};
+use resolver::{build_lockfile, package_name, ResolvedDep, Resolver};
 
 fn main() {
     let cli = Cli::parse_args();
     let verbose = cli.verbose > 0;
     let quiet = cli.quiet;
+    let json = cli.json;
 
     let result = match cli.command {
-        Cmd::Build(args) => cmd_build_top_level(args, verbose, quiet),
+        Cmd::Build(args) => cmd_build_top_level(args, verbose, quiet, json),
         Cmd::Run(args) => cmd_run(args, verbose, quiet),
         Cmd::Init(args) => cmd_init(args, quiet),
         Cmd::Update(args) => cmd_update(args, verbose, quiet),
-        Cmd::Doctor => doctor::run(verbose),
+        Cmd::Doctor => doctor::run(verbose, json),
         Cmd::Sync => cmd_sync(verbose, quiet),
         Cmd::Migrate(args) => migrate::run(&args, quiet),
+        Cmd::Vendor(args) => cmd_vendor(args, verbose, quiet),
     };
 
     if let Err(err) = result {
@@ -54,11 +60,82 @@ fn main() {
 struct BuildOutcome {
     artifact: PathBuf,
     crate_kind: Crate,
+    /// How many library packages (this build's dependencies and/or the root
+    /// package itself) were served from the global build cache instead of
+    /// being recompiled.
+    cache_hits: usize,
 }
 
 /// Top-level `deft build` entry point.
-fn cmd_build_top_level(args: BuildArgs, verbose: bool, quiet: bool) -> Result<()> {
-    build_with_diagnostics(args, verbose, quiet).map(|_| ())
+fn cmd_build_top_level(args: BuildArgs, verbose: bool, quiet: bool, json: bool) -> Result<()> {
+    if !json {
+        return build_with_diagnostics(args, verbose, quiet, json).map(|_| ());
+    }
+
+    let started = Instant::now();
+    let result = build_with_diagnostics(args, verbose, true, true);
+    let duration_ms = started.elapsed().as_millis() as i64;
+
+    let payload = match &result {
+        Ok(outcome) => build_success_payload(outcome, duration_ms),
+        Err(err) => build_failure_payload(err, duration_ms),
+    };
+    println!("{}", payload.render());
+
+    result.map(|_| ())
+}
+
+/// `{"status":"success","duration_ms":N,"cache_hits":N,"artifact":"...","errors":[]}`
+fn build_success_payload(outcome: &BuildOutcome, duration_ms: i64) -> Json {
+    Json::Object(vec![
+        ("status".to_string(), Json::str("success")),
+        ("duration_ms".to_string(), Json::Number(duration_ms)),
+        (
+            "cache_hits".to_string(),
+            Json::Number(outcome.cache_hits as i64),
+        ),
+        (
+            "artifact".to_string(),
+            Json::str(outcome.artifact.display().to_string()),
+        ),
+        ("errors".to_string(), Json::Array(Vec::new())),
+    ])
+}
+
+/// `{"status":"failure","duration_ms":N,"cache_hits":0,"errors":[{...}]}` —
+/// `errors` carries the structured `CompileDiagnostic`s from
+/// `DeftError::Compilation` when available, or a single synthetic entry
+/// built from the error's `Display` text otherwise (e.g. a layout violation
+/// that never reached the compiler at all).
+fn build_failure_payload(err: &DeftError, duration_ms: i64) -> Json {
+    let errors: Vec<Json> = match err {
+        DeftError::Compilation { diagnostics, .. } => diagnostics
+            .iter()
+            .map(|d| {
+                Json::Object(vec![
+                    ("file".to_string(), Json::str(d.file.display().to_string())),
+                    ("line".to_string(), Json::Number(d.line as i64)),
+                    ("column".to_string(), Json::Number(d.column as i64)),
+                    ("severity".to_string(), Json::str(d.severity)),
+                    ("message".to_string(), Json::str(d.message.clone())),
+                ])
+            })
+            .collect(),
+        other => vec![Json::Object(vec![
+            ("file".to_string(), Json::Null),
+            ("line".to_string(), Json::Number(0)),
+            ("column".to_string(), Json::Number(0)),
+            ("severity".to_string(), Json::str("error")),
+            ("message".to_string(), Json::str(other.to_string())),
+        ])],
+    };
+
+    Json::Object(vec![
+        ("status".to_string(), Json::str("failure")),
+        ("duration_ms".to_string(), Json::Number(duration_ms)),
+        ("cache_hits".to_string(), Json::Number(0)),
+        ("errors".to_string(), Json::Array(errors)),
+    ])
 }
 
 /// Run the (intentionally bare) build, and only pay for environment
@@ -67,15 +144,20 @@ fn cmd_build_top_level(args: BuildArgs, verbose: bool, quiet: bool) -> Result<()
 /// that's what keeps the hot path at `deft build`'s target of a near-instant
 /// invocation. Shared by `deft build` and `deft run`, since the latter is
 /// just a build with an extra step.
-fn build_with_diagnostics(args: BuildArgs, verbose: bool, quiet: bool) -> Result<BuildOutcome> {
-    match cmd_build(args, verbose, quiet) {
+fn build_with_diagnostics(
+    args: BuildArgs,
+    verbose: bool,
+    quiet: bool,
+    json: bool,
+) -> Result<BuildOutcome> {
+    match cmd_build(args, verbose, quiet, json) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
-            if !quiet {
+            if !quiet && !json {
                 eprintln!(
                     "\n\x1b[1;33mnote\x1b[0m: build failed — running `deft doctor` diagnostics...\n"
                 );
-                let _ = doctor::run(verbose);
+                let _ = doctor::run(verbose, false);
                 eprintln!();
             }
             Err(err)
@@ -94,16 +176,16 @@ fn cmd_sync(verbose: bool, quiet: bool) -> Result<()> {
 }
 
 /// `deft build`
-fn cmd_build(args: BuildArgs, verbose: bool, quiet: bool) -> Result<BuildOutcome> {
+fn cmd_build(args: BuildArgs, verbose: bool, quiet: bool, json: bool) -> Result<BuildOutcome> {
     let root = project_root(args.manifest_path.as_deref())?;
     let manifest = Manifest::load(&root)?;
 
     if manifest.is_workspace() {
         // Workspaces build each member; we surface the last member's artifact.
-        return build_workspace(&root, &manifest, &args, verbose, quiet);
+        return build_workspace(&root, &manifest, &args, verbose, quiet, json);
     }
 
-    build_single(&root, &manifest, &args, verbose, quiet)
+    build_single(&root, &manifest, &args, verbose, quiet, json)
 }
 
 /// Build a standalone (non-workspace) package.
@@ -113,31 +195,46 @@ fn build_single(
     args: &BuildArgs,
     verbose: bool,
     quiet: bool,
+    json: bool,
 ) -> Result<BuildOutcome> {
     let layout = Layout::assert_deft_standard(root)?;
     let package = require_package(manifest, root)?;
 
-    // --- Dependency resolution -------------------------------------------
-    let resolver = Resolver::new(verbose)?;
-    let existing_lock = Lockfile::load(root)?;
-    let resolved = resolver.resolve_all(manifest, existing_lock.as_ref())?;
-
-    // Write the lock if it was absent (first successful resolution).
-    if existing_lock.is_none() && !resolved.is_empty() {
-        let lock = build_lockfile(&resolved);
-        lock.save(root)?;
-        if !quiet {
-            println!(
-                "\x1b[1;32m    Locking\x1b[0m {} dependenc{}",
-                resolved.len(),
-                if resolved.len() == 1 { "y" } else { "ies" }
-            );
-        }
+    // --- Toolchain pin (opt-in; skipped entirely when unset, preserving the
+    // hot-path guarantee documented in architecture.md) -------------------
+    if let Some(spec) = &package.toolchain {
+        ToolchainSpec::parse(spec)?.validate()?;
     }
+
+    // --- Dependency resolution -------------------------------------------
+    // A populated third_party/ takes over entirely: no git, no network, no
+    // global resolver cache (see `deft vendor`).
+    let resolved = match vendored_dependencies(root, manifest)? {
+        Some(vendored) => vendored,
+        None => {
+            let resolver = Resolver::new(verbose)?;
+            let existing_lock = Lockfile::load(root)?;
+            let resolved = resolver.resolve_all(manifest, existing_lock.as_ref())?;
+
+            // Write the lock if it was absent (first successful resolution).
+            if existing_lock.is_none() && !resolved.is_empty() {
+                let lock = build_lockfile(&resolved);
+                lock.save(root)?;
+                if !quiet {
+                    println!(
+                        "\x1b[1;32m    Locking\x1b[0m {} dependenc{}",
+                        resolved.len(),
+                        if resolved.len() == 1 { "y" } else { "ies" }
+                    );
+                }
+            }
+            resolved
+        }
+    };
 
     // Build dependencies first so their archives/headers exist.
     let target_dir = root.join("target");
-    let dep_includes = build_dependencies(&resolved, &resolver, args, verbose, quiet)?;
+    let (dep_includes, dep_cache_hits) = build_dependencies(&resolved, args, verbose, quiet, json)?;
 
     // --- Compile the root package ----------------------------------------
     let features = manifest.resolve_features(&args.features, args.no_default_features);
@@ -156,8 +253,8 @@ fn build_single(
         args.release,
     );
 
-    let engine = Engine::new(jobs(args), verbose, quiet);
-    let artifact = engine.build_package(
+    let engine = Engine::new(jobs(args), verbose, quiet, json);
+    let built = engine.build_package(
         &layout,
         &package,
         &compiler,
@@ -167,9 +264,57 @@ fn build_single(
     )?;
 
     Ok(BuildOutcome {
-        artifact,
+        artifact: built.path,
         crate_kind: layout.crate_kind,
+        cache_hits: dep_cache_hits + if built.cache_hit { 1 } else { 0 },
     })
+}
+
+/// If `<root>/third_party` exists and is non-empty, resolve dependencies
+/// entirely from local vendored copies plus `deft.lock` metadata, with no
+/// git or network access at all — the offline/autonomous build path enabled
+/// by `deft vendor`.
+fn vendored_dependencies(root: &Path, manifest: &Manifest) -> Result<Option<Vec<ResolvedDep>>> {
+    let vendor_dir = root.join("third_party");
+    let has_entries = std::fs::read_dir(&vendor_dir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if !has_entries {
+        return Ok(None);
+    }
+
+    let lock = Lockfile::load(root)?.ok_or_else(|| {
+        DeftError::Config(
+            "third_party/ is populated but deft.lock is missing; run `deft vendor` again".into(),
+        )
+    })?;
+
+    let mut resolved = Vec::with_capacity(manifest.dependencies.len());
+    for shorthand in manifest.dependencies.keys() {
+        let name = package_name(shorthand);
+        let locked = lock.get(&name).ok_or_else(|| {
+            DeftError::Config(format!(
+                "vendored dependency '{name}' has no entry in deft.lock"
+            ))
+        })?;
+        let cache_path = vendor_dir.join(&name);
+        if !cache_path.is_dir() {
+            return Err(DeftError::Config(format!(
+                "third_party/{name} is missing; run `deft vendor` again"
+            )));
+        }
+        resolved.push(ResolvedDep {
+            name: name.clone(),
+            shorthand: shorthand.clone(),
+            url: locked.source.trim_start_matches("git+").to_string(),
+            source: locked.source.clone(),
+            version: locked.version.clone(),
+            checksum: locked.checksum.clone(),
+            cache_path,
+            dependencies: locked.dependencies.clone(),
+        });
+    }
+    Ok(Some(resolved))
 }
 
 /// Build every member of a workspace in declaration order.
@@ -179,6 +324,7 @@ fn build_workspace(
     args: &BuildArgs,
     verbose: bool,
     quiet: bool,
+    json: bool,
 ) -> Result<BuildOutcome> {
     let members = manifest
         .workspace
@@ -193,22 +339,24 @@ fn build_workspace(
         if !quiet {
             println!("\x1b[1;36m   Workspace\x1b[0m building member '{member}'");
         }
-        let outcome = build_single(&member_root, &member_manifest, args, verbose, quiet)?;
+        let outcome = build_single(&member_root, &member_manifest, args, verbose, quiet, json)?;
         last = Some(outcome);
     }
 
     last.ok_or_else(|| DeftError::LayoutViolation("workspace has no members to build".into()))
 }
 
-/// Build all resolved dependencies and collect their include directories.
+/// Build all resolved dependencies and collect their include directories,
+/// plus how many of them were served from the global build cache.
 fn build_dependencies(
     resolved: &[ResolvedDep],
-    _resolver: &Resolver,
     args: &BuildArgs,
     verbose: bool,
     quiet: bool,
-) -> Result<Vec<PathBuf>> {
+    json: bool,
+) -> Result<(Vec<PathBuf>, usize)> {
     let mut includes = Vec::new();
+    let mut cache_hits = 0usize;
 
     for dep in resolved {
         // Each dependency must itself be deft-standard.
@@ -235,14 +383,14 @@ fn build_dependencies(
         );
 
         let dep_target = dep.cache_path.join("target");
-        let engine = Engine::new(jobs(args), verbose, quiet);
+        let engine = Engine::new(jobs(args), verbose, quiet, json);
 
         // Force library output for dependencies even if they expose main.*.
         let lib_layout = Layout {
             crate_kind: Crate::Library,
             ..dep_layout.clone()
         };
-        engine.build_package(
+        let built = engine.build_package(
             &lib_layout,
             &dep_package,
             &dep_compiler,
@@ -250,18 +398,21 @@ fn build_dependencies(
             None,
             args.release,
         )?;
+        if built.cache_hit {
+            cache_hits += 1;
+        }
 
         // Expose the dependency's src/ as an include path (public headers).
         includes.push(dep.cache_path.join("src"));
         includes.push(dep.cache_path.join("include"));
     }
 
-    Ok(includes)
+    Ok((includes, cache_hits))
 }
 
 /// `deft run`
 fn cmd_run(args: RunArgs, verbose: bool, quiet: bool) -> Result<()> {
-    let outcome = build_with_diagnostics(args.build, verbose, quiet)?;
+    let outcome = build_with_diagnostics(args.build, verbose, quiet, false)?;
     if outcome.crate_kind != Crate::Executable {
         return Err(DeftError::LayoutViolation(
             "`deft run` requires an executable (src/main.cpp or src/main.c)".into(),
@@ -339,6 +490,75 @@ fn cmd_update(args: UpdateArgs, verbose: bool, quiet: bool) -> Result<()> {
                 dep.version,
                 short_sha(&dep.checksum)
             );
+        }
+    }
+    Ok(())
+}
+
+/// `deft vendor` — copy every dependency in `deft.lock` into a local
+/// `third_party/` tree for complete offline autonomy.
+///
+/// Resolution reuses `Resolver::resolve_all` pinned to the existing lock (the
+/// same reproducible path `deft build` takes), so vendoring never silently
+/// re-resolves a dependency to a different commit than what's locked — it
+/// only relocates already-resolved sources from the global cache into the
+/// project itself.
+fn cmd_vendor(args: VendorArgs, verbose: bool, quiet: bool) -> Result<()> {
+    let root = project_root(args.manifest_path.as_deref())?;
+    let manifest = Manifest::load(&root)?;
+    let lock = Lockfile::load(&root)?.ok_or_else(|| {
+        DeftError::Config("no deft.lock found; run `deft build` or `deft update` first".into())
+    })?;
+
+    let resolver = Resolver::new(verbose)?;
+    let resolved = resolver.resolve_all(&manifest, Some(&lock))?;
+
+    let vendor_dir = root.join("third_party");
+    std::fs::create_dir_all(&vendor_dir).path_ctx(&vendor_dir)?;
+
+    for dep in &resolved {
+        let dest = vendor_dir.join(&dep.name);
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest).path_ctx(&dest)?;
+        }
+        copy_tree_excluding_git(&dep.cache_path, &dest)?;
+        if !quiet {
+            println!(
+                "\x1b[1;32m    Vendored\x1b[0m {} v{} -> {}",
+                dep.name,
+                dep.version,
+                dest.display()
+            );
+        }
+    }
+
+    if !quiet {
+        println!(
+            "\x1b[1;32m   Finished\x1b[0m vendoring {} dependenc{} into {}",
+            resolved.len(),
+            if resolved.len() == 1 { "y" } else { "ies" },
+            vendor_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory tree, skipping any `.git` directory — the
+/// vendored copy is a source snapshot, not a git checkout.
+fn copy_tree_excluding_git(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).path_ctx(dst)?;
+    for entry in std::fs::read_dir(src).path_ctx(src)? {
+        let entry = entry.path_ctx(src)?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let dest_path = dst.join(&name);
+        if path.is_dir() {
+            copy_tree_excluding_git(&path, &dest_path)?;
+        } else {
+            std::fs::copy(&path, &dest_path).path_ctx(&dest_path)?;
         }
     }
     Ok(())
@@ -439,7 +659,11 @@ fn jobs(args: &BuildArgs) -> usize {
 }
 
 fn short_sha(sha: &str) -> &str {
-    if sha.len() >= 10 { &sha[..10] } else { sha }
+    if sha.len() >= 10 {
+        &sha[..10]
+    } else {
+        sha
+    }
 }
 
 // --- Scaffolding templates -------------------------------------------------
@@ -467,3 +691,171 @@ exceptions = true\nwarnings = [\"all\", \"extra\"]\noptimization = \"0\"\n";
 
 const C_PROFILE: &str = "[profile.c]\nstandard = \"c17\"\n\
 warnings = [\"all\", \"extra\"]\noptimization = \"0\"\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use manifest::{Dependency, LockedDependency};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let n = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("deft-main-test-{label}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manifest_with_dependency(shorthand: &str) -> Manifest {
+        let mut manifest = Manifest::default();
+        manifest.dependencies.insert(
+            shorthand.to_string(),
+            Dependency {
+                version: "1.0".to_string(),
+                features: Vec::new(),
+                tag: None,
+            },
+        );
+        manifest
+    }
+
+    #[test]
+    fn vendored_dependencies_is_none_without_a_populated_third_party_dir() {
+        let root = temp_dir("no-vendor");
+        let manifest = manifest_with_dependency("gh:user/lib");
+        assert!(vendored_dependencies(&root, &manifest).unwrap().is_none());
+
+        // An empty third_party/ (created but with nothing in it) also counts
+        // as "not vendored" — vendoring is only active once it has content.
+        std::fs::create_dir_all(root.join("third_party")).unwrap();
+        assert!(vendored_dependencies(&root, &manifest).unwrap().is_none());
+    }
+
+    #[test]
+    fn vendored_dependencies_errors_when_lock_is_missing() {
+        let root = temp_dir("missing-lock");
+        std::fs::create_dir_all(root.join("third_party").join("lib")).unwrap();
+        let manifest = manifest_with_dependency("gh:user/lib");
+
+        let err = vendored_dependencies(&root, &manifest).unwrap_err();
+        assert!(err.to_string().contains("deft.lock"));
+    }
+
+    #[test]
+    fn vendored_dependencies_resolves_from_local_copies_and_lock_metadata() {
+        let root = temp_dir("vendored");
+        let dep_dir = root.join("third_party").join("lib");
+        std::fs::create_dir_all(&dep_dir).unwrap();
+
+        let lock = Lockfile {
+            dependencies: vec![LockedDependency {
+                name: "lib".to_string(),
+                source: "git+https://example.com/user/lib.git".to_string(),
+                checksum: "deadbeef".to_string(),
+                version: "1.0".to_string(),
+                dependencies: Vec::new(),
+            }],
+        };
+        lock.save(&root).unwrap();
+
+        let manifest = manifest_with_dependency("gh:user/lib");
+        let resolved = vendored_dependencies(&root, &manifest)
+            .unwrap()
+            .expect("third_party/ is populated, so this must resolve locally");
+
+        assert_eq!(resolved.len(), 1);
+        let dep = &resolved[0];
+        assert_eq!(dep.name, "lib");
+        assert_eq!(dep.checksum, "deadbeef");
+        assert_eq!(dep.cache_path, dep_dir);
+        assert_eq!(dep.url, "https://example.com/user/lib.git");
+    }
+
+    #[test]
+    fn vendored_dependencies_errors_when_a_dependency_directory_is_missing() {
+        let root = temp_dir("partial-vendor");
+        // third_party/ has *something* in it, but not the dependency itself.
+        std::fs::create_dir_all(root.join("third_party").join("other")).unwrap();
+
+        let lock = Lockfile {
+            dependencies: vec![LockedDependency {
+                name: "lib".to_string(),
+                source: "git+https://example.com/user/lib.git".to_string(),
+                checksum: "deadbeef".to_string(),
+                version: "1.0".to_string(),
+                dependencies: Vec::new(),
+            }],
+        };
+        lock.save(&root).unwrap();
+
+        let manifest = manifest_with_dependency("gh:user/lib");
+        let err = vendored_dependencies(&root, &manifest).unwrap_err();
+        assert!(err.to_string().contains("third_party/lib"));
+    }
+
+    #[test]
+    fn copy_tree_excluding_git_skips_git_dir_and_copies_nested_files() {
+        let root = temp_dir("copy-tree");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::create_dir_all(src.join(".git")).unwrap();
+        std::fs::write(src.join("top.txt"), "top").unwrap();
+        std::fs::write(src.join("nested").join("deep.txt"), "deep").unwrap();
+        std::fs::write(src.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
+
+        let dst = root.join("dst");
+        copy_tree_excluding_git(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dst.join("top.txt")).unwrap(), "top");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("nested").join("deep.txt")).unwrap(),
+            "deep"
+        );
+        assert!(!dst.join(".git").exists());
+    }
+
+    #[test]
+    fn build_success_payload_renders_expected_fields() {
+        let outcome = BuildOutcome {
+            artifact: PathBuf::from("/tmp/target/debug/app"),
+            crate_kind: Crate::Executable,
+            cache_hits: 2,
+        };
+        let rendered = build_success_payload(&outcome, 1234).render();
+        assert!(rendered.contains("\"status\":\"success\""));
+        assert!(rendered.contains("\"duration_ms\":1234"));
+        assert!(rendered.contains("\"cache_hits\":2"));
+        assert!(rendered.contains("\"artifact\":\"/tmp/target/debug/app\""));
+        assert!(rendered.contains("\"errors\":[]"));
+    }
+
+    #[test]
+    fn build_failure_payload_surfaces_structured_compile_diagnostics() {
+        let err = DeftError::Compilation {
+            failures: 1,
+            diagnostics: vec![error::CompileDiagnostic {
+                file: PathBuf::from("src/main.c"),
+                line: 4,
+                column: 2,
+                severity: "error",
+                message: "undeclared identifier 'foo'".to_string(),
+            }],
+        };
+        let rendered = build_failure_payload(&err, 42).render();
+        assert!(rendered.contains("\"status\":\"failure\""));
+        assert!(rendered.contains("\"duration_ms\":42"));
+        assert!(rendered.contains("\"line\":4"));
+        assert!(rendered.contains("undeclared identifier"));
+    }
+
+    #[test]
+    fn build_failure_payload_falls_back_to_display_text_for_non_compilation_errors() {
+        let err = DeftError::Config("bad toolchain spec".to_string());
+        let rendered = build_failure_payload(&err, 7).render();
+        assert!(rendered.contains("\"status\":\"failure\""));
+        assert!(rendered.contains("bad toolchain spec"));
+    }
+}

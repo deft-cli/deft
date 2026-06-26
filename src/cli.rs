@@ -26,6 +26,13 @@ pub struct Cli {
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
 
+    /// Emit machine-readable JSON instead of human-readable text.
+    ///
+    /// Honored by `build` and `doctor`; other commands accept the flag (it's
+    /// global) but currently ignore it.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// The subcommand to execute.
     #[command(subcommand)]
     pub command: Command,
@@ -62,6 +69,13 @@ pub enum Command {
 
     /// Generate a starter deft.toml from an existing build system's config.
     Migrate(MigrateArgs),
+
+    /// Vendor every dependency in deft.lock into a local third_party/ tree.
+    ///
+    /// Once third_party/ is populated, subsequent `deft build` runs resolve
+    /// dependencies entirely from those local copies — no git, no network,
+    /// no global cache lookups.
+    Vendor(VendorArgs),
 }
 
 /// Arguments shared by `build` and (transitively) `run`.
@@ -140,6 +154,14 @@ pub struct UpdateArgs {
     pub package: Option<String>,
 }
 
+/// Arguments for `deft vendor`.
+#[derive(clap::Args, Debug)]
+pub struct VendorArgs {
+    /// Path to the project root (defaults to the current directory).
+    #[arg(long, value_name = "DIR")]
+    pub manifest_path: Option<PathBuf>,
+}
+
 /// Arguments for `deft migrate`.
 #[derive(clap::Args, Debug)]
 pub struct MigrateArgs {
@@ -207,6 +229,31 @@ mod tests {
     #[test]
     fn sync_takes_no_positional_arguments() {
         assert!(Cli::try_parse_from(["deft", "sync", "extra"]).is_err());
+    }
+
+    /// `--json` is declared `global = true`, so it must parse both before
+    /// and after the subcommand, on any command — not just `build`/`doctor`
+    /// (those two are the only ones that currently *act* on it).
+    #[test]
+    fn json_flag_is_global_and_defaults_to_false() {
+        let cli = Cli::try_parse_from(["deft", "build"]).unwrap();
+        assert!(!cli.json);
+
+        let before = Cli::try_parse_from(["deft", "--json", "build"]).unwrap();
+        assert!(before.json);
+
+        let after = Cli::try_parse_from(["deft", "doctor", "--json"]).unwrap();
+        assert!(after.json);
+    }
+
+    #[test]
+    fn vendor_parses_as_its_own_command_with_no_positional_arguments() {
+        let cli = Cli::try_parse_from(["deft", "vendor"]).unwrap();
+        match cli.command {
+            Command::Vendor(args) => assert!(args.manifest_path.is_none()),
+            other => panic!("expected Command::Vendor, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["deft", "vendor", "extra"]).is_err());
     }
 
     /// The two variants also carry distinct, doc-comment-derived help text —
