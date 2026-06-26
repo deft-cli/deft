@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::error::Result;
+use crate::json::Json;
+use crate::manifest::{Manifest, ToolchainSpec};
 
 /// One diagnostic check and its outcome.
 struct Check {
@@ -20,14 +22,15 @@ struct Check {
     fix: Option<String>,
 }
 
-/// Run every diagnostic and print a human-readable report.
+/// Run every diagnostic and print a report — human-readable by default, or a
+/// single structured JSON object on stdout when `json` is set.
 ///
 /// Returns `Ok(())` even when checks fail — `doctor` is a report, not a gate.
 /// Callers that care about pass/fail can inspect the process exit code via
 /// [`any_critical_failed`]-style logic if ever needed; today we keep it simple
 /// and always exit 0 after printing, since the report itself is the value.
-pub fn run(verbose: bool) -> Result<()> {
-    let checks = vec![
+pub fn run(verbose: bool, json: bool) -> Result<()> {
+    let mut checks = vec![
         check_compiler("clang", "C"),
         check_compiler("clang++", "C++"),
         check_archiver(),
@@ -36,8 +39,15 @@ pub fn run(verbose: bool) -> Result<()> {
         check_system_headers(),
         check_deft_home(),
     ];
+    if let Some(toolchain) = check_toolchain_pin() {
+        checks.push(toolchain);
+    }
 
-    print_report(&checks, verbose);
+    if json {
+        print_json_report(&checks);
+    } else {
+        print_report(&checks, verbose);
+    }
     Ok(())
 }
 
@@ -72,6 +82,83 @@ fn print_report(checks: &[Check], verbose: bool) {
     if verbose {
         eprintln!("  \x1b[2m[doctor]\x1b[0m ran {} check(s)", checks.len());
     }
+}
+
+/// Build the same checks as a single JSON object: an array of `{name, ok,
+/// detail, fix}` records plus a `passed`/`failed` tally — the "environment
+/// check matrix" CI tooling can parse directly.
+fn build_json_report(checks: &[Check]) -> Json {
+    let passed = checks.iter().filter(|c| c.ok).count();
+    let items: Vec<Json> = checks
+        .iter()
+        .map(|c| {
+            Json::Object(vec![
+                ("name".to_string(), Json::str(c.name)),
+                ("ok".to_string(), Json::Bool(c.ok)),
+                ("detail".to_string(), Json::str(c.detail.clone())),
+                (
+                    "fix".to_string(),
+                    match &c.fix {
+                        Some(f) => Json::str(f.clone()),
+                        None => Json::Null,
+                    },
+                ),
+            ])
+        })
+        .collect();
+
+    Json::Object(vec![
+        ("checks".to_string(), Json::Array(items)),
+        ("passed".to_string(), Json::Number(passed as i64)),
+        (
+            "failed".to_string(),
+            Json::Number((checks.len() - passed) as i64),
+        ),
+    ])
+}
+
+fn print_json_report(checks: &[Check]) {
+    println!("{}", build_json_report(checks).render());
+}
+
+/// If the current directory has a `deft.toml` with a `[package] toolchain`
+/// pin, validate it against the active compiler. Returns `None` (no check
+/// emitted) when there's no project here or no pin declared — `doctor`
+/// otherwise stays project-agnostic, matching every other check above.
+fn check_toolchain_pin() -> Option<Check> {
+    let root = std::env::current_dir().ok()?;
+    let manifest = Manifest::load(&root).ok()?;
+    let spec_str = manifest.package?.toolchain?;
+
+    let spec = match ToolchainSpec::parse(&spec_str) {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(Check {
+                name: "toolchain",
+                ok: false,
+                detail: format!("invalid toolchain spec: {e}"),
+                fix: Some("fix the `toolchain` value in [package] (e.g. \"clang-18.1\")".into()),
+            });
+        }
+    };
+
+    Some(match spec.validate() {
+        Ok(()) => Check {
+            name: "toolchain",
+            ok: true,
+            detail: format!("pinned to {}-{} and satisfied", spec.compiler, spec.version),
+            fix: None,
+        },
+        Err(e) => Check {
+            name: "toolchain",
+            ok: false,
+            detail: e.to_string(),
+            fix: Some(format!(
+                "install/select {} {} (or update [package] toolchain in deft.toml)",
+                spec.compiler, spec.version
+            )),
+        },
+    })
 }
 
 /// Probe a clang driver for presence and version.
@@ -307,5 +394,62 @@ fn install_hint_binutils() -> String {
         "macos" => "install binutils: `brew install binutils`".to_string(),
         "windows" => "install LLVM, which ships `llvm-ar`, or MSYS2 binutils".to_string(),
         _ => "install binutils: `sudo apt install binutils`".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_checks() -> Vec<Check> {
+        vec![
+            Check {
+                name: "clang",
+                ok: true,
+                detail: "clang version 18.1.3".to_string(),
+                fix: None,
+            },
+            Check {
+                name: "ar",
+                ok: false,
+                detail: "not found on PATH".to_string(),
+                fix: Some("install binutils".to_string()),
+            },
+        ]
+    }
+
+    /// The JSON report must be a flat object carrying every check's full
+    /// field set (`fix: None` becomes JSON `null`, never an omitted key) plus
+    /// an accurate pass/fail tally — this is the shape CI tooling parses.
+    #[test]
+    fn json_report_carries_every_check_and_an_accurate_tally() {
+        let checks = sample_checks();
+        let rendered = build_json_report(&checks).render();
+
+        assert!(rendered.contains("\"passed\":1"));
+        assert!(rendered.contains("\"failed\":1"));
+        assert!(rendered.contains("\"name\":\"clang\""));
+        assert!(rendered.contains("\"ok\":true"));
+        assert!(rendered.contains("\"name\":\"ar\""));
+        assert!(rendered.contains("\"fix\":\"install binutils\""));
+        assert!(rendered.contains("\"fix\":null"));
+    }
+
+    #[test]
+    fn json_report_of_empty_checks_has_zero_tally() {
+        let rendered = build_json_report(&[]).render();
+        assert!(rendered.contains("\"passed\":0"));
+        assert!(rendered.contains("\"failed\":0"));
+        assert!(rendered.contains("\"checks\":[]"));
+    }
+
+    /// `doctor` stays project-agnostic by default: with no `deft.toml`
+    /// reachable (or none declaring a `toolchain` pin), no check is emitted
+    /// at all — not a failing one.
+    #[test]
+    fn toolchain_check_is_absent_without_a_pinned_manifest() {
+        // This crate's own repo root has no deft.toml, so running the test
+        // suite from anywhere under it must see no pin.
+        assert!(check_toolchain_pin().is_none());
     }
 }
