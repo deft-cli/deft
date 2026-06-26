@@ -35,6 +35,7 @@ name = "my_project"
 version = "0.2.0"
 description = "optional"
 authors = ["optional", "list"]
+toolchain = "clang-18.1"   # optional
 ```
 
 ```rust
@@ -43,11 +44,50 @@ pub struct Package {
     pub version: String,      // required
     pub description: Option<String>,  // default: None
     pub authors: Vec<String>,         // default: []
+    pub toolchain: Option<String>,    // default: None
 }
 ```
 
 `name` and `version` have no `#[serde(default)]` — both are mandatory once a
 `[package]` table is present at all.
+
+### `toolchain` — pinning the active compiler
+
+`toolchain` is an optional `"<compiler>-<version>"` string, e.g.
+`"clang-18.1"`. `ToolchainSpec::parse` ([manifest.rs](../src/manifest.rs))
+splits on the first `-`, so `compiler = "clang"` and `version = "18.1"`.
+Both halves are required and must be non-empty; an unparsable spec (no `-`,
+or an empty compiler/version half) fails fast with `DeftError::Config`
+*before* any compiler is invoked.
+
+When present, `toolchain` is validated in two places:
+
+- **`deft doctor`** — `check_toolchain_pin` ([doctor.rs](../src/doctor.rs))
+  loads `deft.toml` from the current directory; if it declares a pin, doctor
+  invokes `<compiler> --version` and adds one more row (`toolchain`) to the
+  report. No project here, or no pin declared, means no row at all — doctor
+  stays project-agnostic by default, same as every other check.
+- **The pre-build phase of `deft build`** — `build_single` ([main.rs](../src/main.rs))
+  calls `ToolchainSpec::validate()` immediately after loading `[package]`,
+  before dependency resolution or compilation begins. A mismatch aborts the
+  build with a descriptive `DeftError::Config`, e.g.:
+  ```
+  environment unvalidated: manifest pins toolchain 'clang-18.1' but found 'clang 17.0.6'
+  (run `deft doctor` for details)
+  ```
+
+**Version matching is a dotted-prefix match, not exact equality.** `validate`
+runs `<compiler> --version`, extracts the first dotted version-looking token
+from its output (`extract_compiler_version`, handles both `"clang version
+18.1.3"` and `"Apple clang version 15.0.0 (...)"` forms), and accepts it when
+it equals the pinned `version` *or* starts with `"<version>."`. So a pin of
+`"18.1"` accepts an installed `"18.1.3"` but rejects `"17.x"` or `"19.x"` —
+and, importantly, rejects `"18.10.x"` too, since the prefix check requires
+the separator dot (`"18.1."`), not just a string prefix.
+
+This check is strictly opt-in: a manifest with no `toolchain` field pays
+zero extra cost — `deft build`'s hot path is unaffected (see
+[architecture.md](architecture.md#hot-path-strategy)).
 
 ### `[workspace]`
 
