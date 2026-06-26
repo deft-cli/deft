@@ -203,6 +203,25 @@ impl Compiler {
 
     /// Argument vector for a C translation unit. Only ever reads `c_profile`.
     fn c_args(&self, source: &Path, object: &Path) -> Result<Vec<String>> {
+        let mut args = self.c_flags()?;
+        args.push("-o".to_string());
+        args.push(object.to_string_lossy().to_string());
+        args.push(source.to_string_lossy().to_string());
+        Ok(args)
+    }
+
+    /// Argument vector for a C++ translation unit. Only ever reads `cpp_profile`.
+    fn cpp_args(&self, source: &Path, object: &Path) -> Result<Vec<String>> {
+        let mut args = self.cpp_flags()?;
+        args.push("-o".to_string());
+        args.push(object.to_string_lossy().to_string());
+        args.push(source.to_string_lossy().to_string());
+        Ok(args)
+    }
+
+    /// The C flag set with no source/object paths baked in. Shared by
+    /// `c_args` and [`Compiler::cache_fingerprint`].
+    fn c_flags(&self) -> Result<Vec<String>> {
         let p = &self.c_profile;
         let opt = self.effective_opt(&p.optimization)?;
         let mut args = Vec::new();
@@ -217,15 +236,12 @@ impl Compiler {
         for extra in &p.extra_flags {
             args.push(extra.clone());
         }
-
-        args.push("-o".to_string());
-        args.push(object.to_string_lossy().to_string());
-        args.push(source.to_string_lossy().to_string());
         Ok(args)
     }
 
-    /// Argument vector for a C++ translation unit. Only ever reads `cpp_profile`.
-    fn cpp_args(&self, source: &Path, object: &Path) -> Result<Vec<String>> {
+    /// The C++ flag set with no source/object paths baked in. Shared by
+    /// `cpp_args` and [`Compiler::cache_fingerprint`].
+    fn cpp_flags(&self) -> Result<Vec<String>> {
         let p = &self.cpp_profile;
         let opt = self.effective_opt(&p.optimization)?;
         let mut args = Vec::new();
@@ -253,11 +269,18 @@ impl Compiler {
         for extra in &p.extra_flags {
             args.push(extra.clone());
         }
-
-        args.push("-o".to_string());
-        args.push(object.to_string_lossy().to_string());
-        args.push(source.to_string_lossy().to_string());
         Ok(args)
+    }
+
+    /// Flags-only fingerprint for the global build cache: every flag that
+    /// affects codegen, with no source/object paths baked in, so the same
+    /// flags produce the same cache key regardless of where the project
+    /// lives on disk.
+    pub fn cache_fingerprint(&self, language: Language) -> Result<Vec<String>> {
+        match language {
+            Language::C => self.c_flags(),
+            Language::Cpp => self.cpp_flags(),
+        }
     }
 
     /// Flags common to both languages: includes, defines, debug/release shaping.
@@ -456,6 +479,33 @@ mod tests {
             assert_eq!(Path::new("main.o").extension().unwrap(), "o");
             assert_eq!(Path::new("libmy.a").extension().unwrap(), "a");
         }
+    }
+
+    /// The cache fingerprint must change when a flag-affecting profile field
+    /// changes, and must never embed any source/object path (it has to be
+    /// portable across machines/checkouts for the global cache to be useful).
+    #[test]
+    fn cache_fingerprint_excludes_paths_and_reflects_profile_changes() {
+        let baseline = compiler();
+        let fp_debug = baseline.cache_fingerprint(Language::C).unwrap();
+        assert!(!fp_debug
+            .iter()
+            .any(|f| f.contains(".c") || f.contains(".o")));
+
+        let release_profile = CProfile {
+            optimization: "0".to_string(),
+            ..CProfile::default()
+        };
+        let release = Compiler::new(
+            release_profile,
+            CppProfile::default(),
+            Vec::new(),
+            &[],
+            true,
+        );
+        let fp_release = release.cache_fingerprint(Language::C).unwrap();
+
+        assert_ne!(fp_debug, fp_release);
     }
 
     #[test]
