@@ -46,8 +46,13 @@ pub enum DeftError {
         stderr: String,
     },
 
-    /// Compilation failed; carries the count of failed translation units.
-    Compilation { failures: usize },
+    /// Compilation failed; carries the count of failed translation units and
+    /// the structured diagnostics behind them (consumed by `--json` output,
+    /// in addition to the terminal renderer in `engine.rs`).
+    Compilation {
+        failures: usize,
+        diagnostics: Vec<CompileDiagnostic>,
+    },
 
     /// A configuration value was invalid (e.g. unknown optimization level).
     Config(String),
@@ -111,7 +116,7 @@ impl fmt::Display for DeftError {
                     stderr.trim()
                 )
             }
-            DeftError::Compilation { failures } => {
+            DeftError::Compilation { failures, .. } => {
                 write!(
                     f,
                     "build failed: {} translation unit(s) did not compile",
@@ -142,6 +147,18 @@ impl From<io::Error> for DeftError {
 
 /// Convenience alias so signatures stay short.
 pub type Result<T> = std::result::Result<T, DeftError>;
+
+/// One structured compiler diagnostic, carried by `DeftError::Compilation` so
+/// `--json` build output can render exactly what the terminal renderer
+/// (`engine.rs`) shows, without re-parsing clang's stderr a second time.
+#[derive(Debug, Clone)]
+pub struct CompileDiagnostic {
+    pub file: PathBuf,
+    pub line: usize,
+    pub column: usize,
+    pub severity: &'static str,
+    pub message: String,
+}
 
 /// Helper to attach a path to an io error after the fact.
 pub trait IoPathExt<T> {
