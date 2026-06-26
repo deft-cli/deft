@@ -383,10 +383,7 @@ mod tests {
             assert!(is_cpp_source(s), "expected dominant cpp source, got {s}");
         }
         for s in &project.conflicting_sources {
-            assert!(
-                !is_cpp_source(s),
-                "expected minority c source, got {s}"
-            );
+            assert!(!is_cpp_source(s), "expected minority c source, got {s}");
         }
     }
 
