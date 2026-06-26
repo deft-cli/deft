@@ -900,6 +900,7 @@ mod tests {
         let compiler = Compiler::new(
             CProfile::default(),
             CppProfile::default(),
+            &project,
             Vec::new(),
             &[],
             false,

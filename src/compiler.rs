@@ -126,6 +126,10 @@ pub struct CompileUnit {
 pub struct Compiler {
     c_profile: CProfile,
     cpp_profile: CppProfile,
+    /// The package's own `include/` directory, always searched first so its
+    /// public headers resolve regardless of what the caller passed in
+    /// `include_dirs`.
+    own_include_dir: PathBuf,
     /// `-I` include directories shared by both languages (dependency headers).
     include_dirs: Vec<PathBuf>,
     /// `-D` defines injected for active features, e.g. `DEFT_FEATURE_SSL`.
@@ -137,9 +141,15 @@ pub struct Compiler {
 }
 
 impl Compiler {
+    /// `package_root` is the root of the package being compiled (the
+    /// directory containing its `deft.toml`); its `include/` subdirectory is
+    /// unconditionally added to the header search path, independent of
+    /// `include_dirs` (which carries *other* packages' public headers, e.g.
+    /// dependencies).
     pub fn new(
         c_profile: CProfile,
         cpp_profile: CppProfile,
+        package_root: &Path,
         include_dirs: Vec<PathBuf>,
         active_features: &[String],
         release: bool,
@@ -148,9 +158,14 @@ impl Compiler {
             .iter()
             .map(|f| format!("DEFT_FEATURE_{}", f.to_ascii_uppercase().replace('-', "_")))
             .collect();
+        let include_dir = package_root.join("include");
         Compiler {
             c_profile,
             cpp_profile,
+            // Absolute so the flag is correct regardless of clang's cwd at
+            // invocation time; falls back to the joined (possibly relative)
+            // path if the directory doesn't exist yet to canonicalize.
+            own_include_dir: include_dir.canonicalize().unwrap_or(include_dir),
             include_dirs,
             feature_defines,
             debug: !release,
@@ -289,6 +304,7 @@ impl Compiler {
         args.push("-fcolor-diagnostics".to_string());
         args.push("-fno-caret-diagnostics".to_string());
 
+        args.push(format!("-I{}", self.own_include_dir.display()));
         for dir in &self.include_dirs {
             args.push(format!("-I{}", dir.display()));
         }
@@ -401,6 +417,7 @@ mod tests {
         Compiler::new(
             CProfile::default(),
             CppProfile::default(),
+            Path::new("."),
             Vec::new(),
             &[],
             false,
@@ -499,6 +516,7 @@ mod tests {
         let release = Compiler::new(
             release_profile,
             CppProfile::default(),
+            Path::new("."),
             Vec::new(),
             &[],
             true,
