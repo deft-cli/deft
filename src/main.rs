@@ -248,6 +248,7 @@ fn build_single(
     let compiler = Compiler::new(
         manifest.profile.c.clone().unwrap_or_default(),
         manifest.profile.cpp.clone().unwrap_or_default(),
+        root,
         dep_includes,
         &features,
         args.release,
@@ -377,6 +378,7 @@ fn build_dependencies(
         let dep_compiler = Compiler::new(
             dep_manifest.profile.c.clone().unwrap_or_default(),
             dep_manifest.profile.cpp.clone().unwrap_or_default(),
+            &dep.cache_path,
             Vec::new(),
             &dep_features,
             args.release,

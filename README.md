@@ -4,7 +4,7 @@
 <h6>A modern package manager and build system for C and C++, with strict
 project-layout enforcement and deep Clang integration.</h6>
 
-[![Deft Version](https://img.shields.io/badge/version-0.3.0-e.svg?style=for-the-badge&labelColor=000000&color=ffffff)](https://github.com/deft-cli/deft/releases/tag/v0.3.0)
+[![Deft Version](https://img.shields.io/badge/version-0.4.0-e.svg?style=for-the-badge&labelColor=000000&color=ffffff)](https://github.com/deft-cli/deft/releases/tag/v0.4.0)
 [![Platform Support](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg?style=for-the-badge&labelColor=000000&color=ffffff)](#)
 
 </div>
@@ -27,6 +27,12 @@ rationale.
 - **Manifest-driven Clang.** Optimization levels, warnings, language
   standard, RTTI, and exceptions all live in `deft.toml`. No messy flag
   strings.
+- **Native sanitizer support.** Declare `sanitizers = ["address", "undefined"]`
+  in `[profile.c]`/`[profile.cpp]` and deft propagates the matching
+  `-fsanitize=` flags to both compilation and linking, forces `-g` so stack
+  traces stay readable, and rejects unsafe combinations (LTO with
+  ASan/LSan, or TSan with ASan/LSan) before invoking clang. See
+  [Sanitizers](#sanitizers) below.
 - **Reproducible builds.** `deft.lock` pins every dependency to an exact git
   commit SHA, written atomically. `deft build` always honors the lock;
   `deft update` is the only command that rewrites it.
@@ -78,6 +84,51 @@ Full flag-by-flag mechanics (what `--release` actually overrides, how
 deft init hello && cd hello
 deft run
 ```
+
+## Sanitizers
+
+`[profile.c]` and `[profile.cpp]` accept a `sanitizers` array of Clang
+sanitizer names, plus an `lto` toggle:
+
+```toml
+[profile.c]
+standard = "c17"
+optimization = "0"
+sanitizers = ["address", "undefined"]
+extra_flags = ["-fno-omit-frame-pointer"]
+```
+
+| Manifest string | Clang flag |
+| --- | --- |
+| `"address"` | `-fsanitize=address` (ASan) |
+| `"thread"` | `-fsanitize=thread` (TSan) |
+| `"undefined"` | `-fsanitize=undefined` (UBSan) |
+| `"leak"` | `-fsanitize=leak` (LSan) |
+
+Omitting `sanitizers` (or leaving it `[]`) is fully backwards-compatible with
+v0.3.0 manifests — no instrumentation, no behavior change.
+
+**Safety constraints, enforced before clang is ever invoked:**
+
+- `lto = true` together with `"address"` or `"leak"` aborts the build — LTO
+  and ASan/LSan are mutually exclusive (link-time reordering/inlining across
+  the instrumentation boundary produces unreliable results and much slower
+  links).
+- `"thread"` together with `"address"` or `"leak"` aborts the build — their
+  runtime libraries install conflicting interceptors and can't coexist in one
+  binary.
+- Any non-empty `sanitizers` array forces `-g` into the compile flags, even
+  under `--release`, so sanitizer stack traces resolve to real file/line
+  info instead of raw addresses. A release build with active sanitizers
+  prints one warning noting this override.
+
+The same `-fsanitize=` (and `-flto`) flags used to compile the package's
+translation units are also passed to the final link step, and are always
+injected *before* `extra_flags`, so granular sub-flags like
+`-fno-omit-frame-pointer` can still be layered on afterward. Library builds
+go through the archiver, not clang's linker, so sanitizer flags don't apply
+there. See [docs/guides/manifest.md](docs/guides/manifest.md#sanitizers-and-lto--clang-sanitizer-support)
+for the full mechanics.
 
 ## The deft home
 

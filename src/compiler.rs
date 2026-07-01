@@ -96,6 +96,81 @@ impl OptLevel {
     }
 }
 
+/// A Clang sanitizer, parsed from the manifest's `sanitizers` array into a
+/// closed set so an unrecognized name fails fast instead of silently being
+/// dropped or mis-forwarded to clang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sanitizer {
+    Address,
+    Thread,
+    Undefined,
+    Leak,
+}
+
+impl Sanitizer {
+    pub fn parse(raw: &str) -> Result<Sanitizer> {
+        Ok(match raw.trim() {
+            "address" => Sanitizer::Address,
+            "thread" => Sanitizer::Thread,
+            "undefined" => Sanitizer::Undefined,
+            "leak" => Sanitizer::Leak,
+            other => {
+                return Err(DeftError::Config(format!(
+                    "unknown sanitizer '{other}' (expected address, thread, undefined, leak)"
+                )));
+            }
+        })
+    }
+
+    /// The exact `-fsanitize=<name>` clang flag, shared verbatim between the
+    /// compile and link commands so both phases agree on instrumentation.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Sanitizer::Address => "-fsanitize=address",
+            Sanitizer::Thread => "-fsanitize=thread",
+            Sanitizer::Undefined => "-fsanitize=undefined",
+            Sanitizer::Leak => "-fsanitize=leak",
+        }
+    }
+}
+
+/// Parse every entry of a manifest's `sanitizers` array, failing on the first
+/// unrecognized name.
+fn parse_sanitizers(raw: &[String]) -> Result<Vec<Sanitizer>> {
+    raw.iter().map(|s| Sanitizer::parse(s)).collect()
+}
+
+/// The pre-build safety matrix: catches sanitizer/LTO combinations that clang
+/// accepts syntactically but that are unsafe or unsupported at runtime, so
+/// deft aborts before spending any time compiling.
+///
+/// `label` is the profile name ("C" or "C++") for a precise error message.
+fn validate_sanitizer_matrix(sanitizers: &[Sanitizer], lto: bool, label: &str) -> Result<()> {
+    let has = |s: Sanitizer| sanitizers.contains(&s);
+
+    if lto && (has(Sanitizer::Address) || has(Sanitizer::Leak)) {
+        return Err(DeftError::Config(format!(
+            "[profile.{}] enables LTO together with the address/leak sanitizer, which are \
+             mutually exclusive: link-time optimization can reorder and inline across the \
+             instrumentation boundary, producing unreliable ASan/LSan results and \
+             substantially slower links. Disable `lto` or remove \"address\"/\"leak\" from \
+             `sanitizers`.",
+            label.to_ascii_lowercase()
+        )));
+    }
+
+    if has(Sanitizer::Thread) && (has(Sanitizer::Address) || has(Sanitizer::Leak)) {
+        return Err(DeftError::Config(format!(
+            "[profile.{}] combines the thread sanitizer with the address/leak sanitizer: \
+             their runtime libraries install conflicting interceptors and cannot be linked \
+             into the same binary. Pick one sanitizer family at a time.",
+            label.to_ascii_lowercase()
+        )));
+    }
+
+    Ok(())
+}
+
 /// Map a warning keyword from the manifest to a clang `-W` flag.
 ///
 /// Unknown keywords are passed through as `-W<keyword>` so users can name any
@@ -126,6 +201,10 @@ pub struct CompileUnit {
 pub struct Compiler {
     c_profile: CProfile,
     cpp_profile: CppProfile,
+    /// The package's own `include/` directory, always searched first so its
+    /// public headers resolve regardless of what the caller passed in
+    /// `include_dirs`.
+    own_include_dir: PathBuf,
     /// `-I` include directories shared by both languages (dependency headers).
     include_dirs: Vec<PathBuf>,
     /// `-D` defines injected for active features, e.g. `DEFT_FEATURE_SSL`.
@@ -137,9 +216,15 @@ pub struct Compiler {
 }
 
 impl Compiler {
+    /// `package_root` is the root of the package being compiled (the
+    /// directory containing its `deft.toml`); its `include/` subdirectory is
+    /// unconditionally added to the header search path, independent of
+    /// `include_dirs` (which carries *other* packages' public headers, e.g.
+    /// dependencies).
     pub fn new(
         c_profile: CProfile,
         cpp_profile: CppProfile,
+        package_root: &Path,
         include_dirs: Vec<PathBuf>,
         active_features: &[String],
         release: bool,
@@ -148,9 +233,14 @@ impl Compiler {
             .iter()
             .map(|f| format!("DEFT_FEATURE_{}", f.to_ascii_uppercase().replace('-', "_")))
             .collect();
+        let include_dir = package_root.join("include");
         Compiler {
             c_profile,
             cpp_profile,
+            // Absolute so the flag is correct regardless of clang's cwd at
+            // invocation time; falls back to the joined (possibly relative)
+            // path if the directory doesn't exist yet to canonicalize.
+            own_include_dir: include_dir.canonicalize().unwrap_or(include_dir),
             include_dirs,
             feature_defines,
             debug: !release,
@@ -163,7 +253,30 @@ impl Compiler {
     pub fn validate(&self) -> Result<()> {
         OptLevel::parse(&self.c_profile.optimization)?;
         OptLevel::parse(&self.cpp_profile.optimization)?;
+
+        let c_sanitizers = parse_sanitizers(&self.c_profile.sanitizers)?;
+        validate_sanitizer_matrix(&c_sanitizers, self.c_profile.lto, "C")?;
+        self.warn_if_sanitizers_strip_symbols(&c_sanitizers);
+
+        let cpp_sanitizers = parse_sanitizers(&self.cpp_profile.sanitizers)?;
+        validate_sanitizer_matrix(&cpp_sanitizers, self.cpp_profile.lto, "C++")?;
+        self.warn_if_sanitizers_strip_symbols(&cpp_sanitizers);
+
         Ok(())
+    }
+
+    /// Sanitizer stack traces are unreadable raw addresses without `-g`.
+    /// `push_common` always forces `-g` in when sanitizers are active
+    /// (correctness), but a release/optimized profile choosing to omit debug
+    /// symbols is surprising enough that it deserves one up-front warning
+    /// rather than a silently-overridden profile setting.
+    fn warn_if_sanitizers_strip_symbols(&self, sanitizers: &[Sanitizer]) {
+        if !sanitizers.is_empty() && self.release {
+            eprintln!(
+                "\x1b[1;33mwarning\x1b[0m: active sanitizers force `-g` (debug symbols) into \
+                 this release/optimized build so stack traces stay readable"
+            );
+        }
     }
 
     /// Resolve the optimization level actually handed to clang.
@@ -224,6 +337,7 @@ impl Compiler {
     fn c_flags(&self) -> Result<Vec<String>> {
         let p = &self.c_profile;
         let opt = self.effective_opt(&p.optimization)?;
+        let sanitizers = parse_sanitizers(&p.sanitizers)?;
         let mut args = Vec::new();
 
         args.push("-c".to_string());
@@ -232,7 +346,13 @@ impl Compiler {
         for w in &p.warnings {
             args.push(warning_flag(w));
         }
-        self.push_common(&mut args, &p.defines);
+        self.push_common(&mut args, &p.defines, !sanitizers.is_empty());
+        if p.lto {
+            args.push("-flto".to_string());
+        }
+        for s in &sanitizers {
+            args.push(s.flag().to_string());
+        }
         for extra in &p.extra_flags {
             args.push(extra.clone());
         }
@@ -244,6 +364,7 @@ impl Compiler {
     fn cpp_flags(&self) -> Result<Vec<String>> {
         let p = &self.cpp_profile;
         let opt = self.effective_opt(&p.optimization)?;
+        let sanitizers = parse_sanitizers(&p.sanitizers)?;
         let mut args = Vec::new();
 
         args.push("-c".to_string());
@@ -265,7 +386,13 @@ impl Compiler {
         for w in &p.warnings {
             args.push(warning_flag(w));
         }
-        self.push_common(&mut args, &p.defines);
+        self.push_common(&mut args, &p.defines, !sanitizers.is_empty());
+        if p.lto {
+            args.push("-flto".to_string());
+        }
+        for s in &sanitizers {
+            args.push(s.flag().to_string());
+        }
         for extra in &p.extra_flags {
             args.push(extra.clone());
         }
@@ -284,11 +411,23 @@ impl Compiler {
     }
 
     /// Flags common to both languages: includes, defines, debug/release shaping.
-    fn push_common(&self, args: &mut Vec<String>, profile_defines: &[String]) {
+    ///
+    /// `force_debug_syms` is true when the profile has at least one active
+    /// sanitizer: sanitizer stack traces are unreadable raw addresses without
+    /// `-g`, so deft injects it even in a release/optimized profile that
+    /// would otherwise strip symbols — and warns once when it has to override
+    /// the profile's own choice.
+    fn push_common(
+        &self,
+        args: &mut Vec<String>,
+        profile_defines: &[String],
+        force_debug_syms: bool,
+    ) {
         // Emit machine-parseable diagnostics with caret context.
         args.push("-fcolor-diagnostics".to_string());
         args.push("-fno-caret-diagnostics".to_string());
 
+        args.push(format!("-I{}", self.own_include_dir.display()));
         for dir in &self.include_dirs {
             args.push(format!("-I{}", dir.display()));
         }
@@ -296,7 +435,7 @@ impl Compiler {
             args.push(format!("-D{def}"));
         }
 
-        if self.debug {
+        if self.debug || force_debug_syms {
             args.push("-g".to_string());
         }
         if self.release {
@@ -329,8 +468,31 @@ impl Compiler {
             return archiver_candidates(objects, output);
         }
 
-        let driver = if has_cpp { "clang++" } else { "clang" };
+        // A package is strictly single-language (enforced by the layout
+        // check upstream), so `has_cpp` doubles as "which profile's
+        // sanitizers/lto actually compiled this unit" — the same flags must
+        // reach the linker or the sanitizer runtime/LTO summary won't match
+        // what the object files were compiled with.
+        let (driver, profile_lto, profile_sanitizers) = if has_cpp {
+            (
+                "clang++",
+                self.cpp_profile.lto,
+                &self.cpp_profile.sanitizers,
+            )
+        } else {
+            ("clang", self.c_profile.lto, &self.c_profile.sanitizers)
+        };
+        // Already validated in `Compiler::validate()` before any compilation
+        // started, so parsing here can only fail if that check was skipped.
+        let sanitizers = parse_sanitizers(profile_sanitizers).unwrap_or_default();
+
         let mut args = Vec::new();
+        if profile_lto {
+            args.push("-flto".to_string());
+        }
+        for s in &sanitizers {
+            args.push(s.flag().to_string());
+        }
         for o in objects {
             args.push(o.to_string_lossy().to_string());
         }
@@ -401,6 +563,7 @@ mod tests {
         Compiler::new(
             CProfile::default(),
             CppProfile::default(),
+            Path::new("."),
             Vec::new(),
             &[],
             false,
@@ -499,6 +662,7 @@ mod tests {
         let release = Compiler::new(
             release_profile,
             CppProfile::default(),
+            Path::new("."),
             Vec::new(),
             &[],
             true,
@@ -521,5 +685,176 @@ mod tests {
             );
         }
         assert_eq!(Language::from_extension(Path::new("foo.h")), None);
+    }
+
+    #[test]
+    fn sanitizer_parse_accepts_all_four_and_rejects_unknown() {
+        assert_eq!(Sanitizer::parse("address").unwrap(), Sanitizer::Address);
+        assert_eq!(Sanitizer::parse("thread").unwrap(), Sanitizer::Thread);
+        assert_eq!(Sanitizer::parse("undefined").unwrap(), Sanitizer::Undefined);
+        assert_eq!(Sanitizer::parse("leak").unwrap(), Sanitizer::Leak);
+        assert!(Sanitizer::parse("bogus").is_err());
+    }
+
+    fn compiler_with(c: CProfile) -> Compiler {
+        Compiler::new(
+            c,
+            CppProfile::default(),
+            Path::new("."),
+            Vec::new(),
+            &[],
+            false,
+        )
+    }
+
+    /// LTO combined with ASan or LSan must abort validation with a clear
+    /// explanation, since link-time optimization and these sanitizers are
+    /// mutually exclusive.
+    #[test]
+    fn validate_rejects_lto_with_address_or_leak_sanitizer() {
+        let c = compiler_with(CProfile {
+            lto: true,
+            sanitizers: vec!["address".to_string()],
+            ..CProfile::default()
+        });
+        assert!(c.validate().is_err());
+
+        let c = compiler_with(CProfile {
+            lto: true,
+            sanitizers: vec!["leak".to_string()],
+            ..CProfile::default()
+        });
+        assert!(c.validate().is_err());
+
+        // LTO alone, or LTO with an unrelated sanitizer, is fine.
+        let c = compiler_with(CProfile {
+            lto: true,
+            sanitizers: vec!["undefined".to_string()],
+            ..CProfile::default()
+        });
+        assert!(c.validate().is_ok());
+    }
+
+    /// TSan can never coexist with ASan/LSan in the same binary — their
+    /// runtime interceptors conflict.
+    #[test]
+    fn validate_rejects_thread_with_address_or_leak_sanitizer() {
+        let c = compiler_with(CProfile {
+            sanitizers: vec!["thread".to_string(), "address".to_string()],
+            ..CProfile::default()
+        });
+        assert!(c.validate().is_err());
+
+        let c = compiler_with(CProfile {
+            sanitizers: vec!["thread".to_string(), "leak".to_string()],
+            ..CProfile::default()
+        });
+        assert!(c.validate().is_err());
+
+        let c = compiler_with(CProfile {
+            sanitizers: vec!["thread".to_string(), "undefined".to_string()],
+            ..CProfile::default()
+        });
+        assert!(c.validate().is_ok());
+    }
+
+    /// An unrecognized sanitizer name fails validation up front, same as an
+    /// unrecognized optimization level.
+    #[test]
+    fn validate_rejects_unknown_sanitizer_name() {
+        let c = compiler_with(CProfile {
+            sanitizers: vec!["valgrind".to_string()],
+            ..CProfile::default()
+        });
+        assert!(c.validate().is_err());
+    }
+
+    /// An empty `sanitizers` array (the default) must behave exactly like a
+    /// v0.3.0 manifest that never mentions sanitizers at all: no `-g`
+    /// injection beyond the profile's own debug/release setting, and no
+    /// `-fsanitize=` flags anywhere in the compile args.
+    #[test]
+    fn empty_sanitizers_is_backwards_compatible_with_v0_3_0() {
+        let c = compiler();
+        let args = c.c_flags().unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("-fsanitize=")));
+        assert!(!args.contains(&"-flto".to_string()));
+    }
+
+    /// Active sanitizers must append `-g` and the matching `-fsanitize=`
+    /// flags to the compile args, strictly before any user `extra_flags`, so
+    /// power users can still append granular sub-flags afterward.
+    #[test]
+    fn active_sanitizers_inject_debug_symbols_and_precede_extra_flags() {
+        let c = compiler_with(CProfile {
+            sanitizers: vec!["address".to_string(), "undefined".to_string()],
+            extra_flags: vec!["-fno-omit-frame-pointer".to_string()],
+            ..CProfile::default()
+        });
+        let args = c.c_flags().unwrap();
+
+        assert!(args.contains(&"-g".to_string()));
+        let asan_pos = args
+            .iter()
+            .position(|a| a == "-fsanitize=address")
+            .expect("asan flag present");
+        let ubsan_pos = args
+            .iter()
+            .position(|a| a == "-fsanitize=undefined")
+            .expect("ubsan flag present");
+        let extra_pos = args
+            .iter()
+            .position(|a| a == "-fno-omit-frame-pointer")
+            .expect("extra flag present");
+        assert!(asan_pos < extra_pos);
+        assert!(ubsan_pos < extra_pos);
+    }
+
+    /// The exact same `-fsanitize=` flags compiled into the object files must
+    /// also reach the final link command, and must precede the object files
+    /// in the argument vector.
+    #[test]
+    fn link_command_propagates_matching_sanitizer_flags() {
+        let c = compiler_with(CProfile {
+            sanitizers: vec!["address".to_string()],
+            ..CProfile::default()
+        });
+        let objects = vec![PathBuf::from("main.o")];
+        let output = PathBuf::from("app");
+
+        let cmds = c.link_command(&objects, &output, false, false);
+        assert_eq!(cmds.len(), 1);
+        let sanitize_pos = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "-fsanitize=address")
+            .expect("asan flag present at link time");
+        let object_pos = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "main.o")
+            .expect("object file present");
+        assert!(sanitize_pos < object_pos);
+    }
+
+    /// Library builds go through the archiver, not the linker — sanitizer
+    /// flags are meaningless there and must not appear.
+    #[test]
+    fn link_command_library_has_no_sanitizer_flags() {
+        let c = compiler_with(CProfile {
+            sanitizers: vec!["address".to_string()],
+            ..CProfile::default()
+        });
+        let objects = vec![PathBuf::from("a.o")];
+        let output = if cfg!(target_os = "windows") {
+            PathBuf::from("mylib.lib")
+        } else {
+            PathBuf::from("libmy.a")
+        };
+
+        let cmds = c.link_command(&objects, &output, false, true);
+        for cmd in &cmds {
+            assert!(!cmd.args.iter().any(|a| a.starts_with("-fsanitize=")));
+        }
     }
 }
