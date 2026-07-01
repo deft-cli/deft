@@ -90,6 +90,14 @@ pub struct CProfile {
     /// Preprocessor defines: NAME or NAME=VALUE.
     #[serde(default)]
     pub defines: Vec<String>,
+    /// Clang sanitizers to instrument the build with, e.g. `["address",
+    /// "undefined"]`. Default: `[]` (no manifest, or an absent key, produces
+    /// zero instrumentation — identical to a v0.3.0 manifest).
+    #[serde(default)]
+    pub sanitizers: Vec<String>,
+    /// Link-Time Optimization. Default: `false`.
+    #[serde(default)]
+    pub lto: bool,
 }
 
 impl Default for CProfile {
@@ -100,6 +108,8 @@ impl Default for CProfile {
             optimization: default_opt(),
             extra_flags: Vec::new(),
             defines: Vec::new(),
+            sanitizers: Vec::new(),
+            lto: false,
         }
     }
 }
@@ -124,6 +134,14 @@ pub struct CppProfile {
     pub extra_flags: Vec<String>,
     #[serde(default)]
     pub defines: Vec<String>,
+    /// Clang sanitizers to instrument the build with, e.g. `["address",
+    /// "undefined"]`. Default: `[]` (no manifest, or an absent key, produces
+    /// zero instrumentation — identical to a v0.3.0 manifest).
+    #[serde(default)]
+    pub sanitizers: Vec<String>,
+    /// Link-Time Optimization. Default: `false`.
+    #[serde(default)]
+    pub lto: bool,
 }
 
 impl Default for CppProfile {
@@ -136,6 +154,8 @@ impl Default for CppProfile {
             optimization: default_opt(),
             extra_flags: Vec::new(),
             defines: Vec::new(),
+            sanitizers: Vec::new(),
+            lto: false,
         }
     }
 }
