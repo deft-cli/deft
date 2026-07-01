@@ -134,6 +134,8 @@ warnings = ["all", "extra"] # default: []
 optimization = "0"          # default: "0"
 extra_flags = []             # default: []
 defines = []                  # default: []
+sanitizers = []                # default: []
+lto = false                     # default: false
 
 [profile.cpp]
 standard = "c++20"          # default: "c++20"
@@ -143,6 +145,8 @@ warnings = ["all", "extra"] # default: []
 optimization = "0"          # default: "0"
 extra_flags = []             # default: []
 defines = []                  # default: []
+sanitizers = []                # default: []
+lto = false                     # default: false
 ```
 
 `Profiles` is `{ c: Option<CProfile>, cpp: Option<CppProfile>, ...
@@ -180,6 +184,70 @@ equivalent, since these are C++ language features. `false` maps to
 `-frtti`/`-fexceptions`. This field-level asymmetry between `CProfile` and
 `CppProfile` is itself part of deft's compiler boundary isolation — see
 [architecture.md](architecture.md#compiler-boundary-isolation).
+
+### `sanitizers` and `lto` — Clang sanitizer support
+
+```toml
+[profile.c]
+sanitizers = ["address", "undefined"]
+lto = false
+```
+
+`sanitizers` is a plain `Vec<String>`, `#[serde(default)]`-backed like every
+other profile field — an absent key parses to `[]`, identical to a v0.3.0
+manifest, with zero behavioral change. Each entry maps through
+`Sanitizer::parse` ([compiler.rs](../src/compiler.rs)) to a closed enum:
+
+| Manifest string | Enum variant | Clang flag |
+|---|---|---|
+| `"address"` | `Sanitizer::Address` | `-fsanitize=address` |
+| `"thread"` | `Sanitizer::Thread` | `-fsanitize=thread` |
+| `"undefined"` | `Sanitizer::Undefined` | `-fsanitize=undefined` |
+| `"leak"` | `Sanitizer::Leak` | `-fsanitize=leak` |
+
+An unrecognized string (anything else) fails with `DeftError::Config` at
+validation time, before any compilation begins — same fail-fast contract as
+`optimization`.
+
+**Pre-build safety matrix.** `Compiler::validate()` runs
+`validate_sanitizer_matrix` against each profile independently (C's
+`sanitizers`/`lto` and C++'s `sanitizers`/`lto` are checked separately, since
+a package only ever builds one of the two) and aborts the build with a
+`DeftError::Config` before invoking clang at all if:
+
+- **`lto = true`** together with `"address"` or `"leak"` in `sanitizers` — LTO
+  and ASan/LSan are mutually exclusive: link-time optimization can reorder
+  and inline across the instrumentation boundary, producing unreliable
+  results and substantially slower links.
+- **`"thread"`** is present together with `"address"` or `"leak"` — their
+  runtime libraries install conflicting interceptors and cannot be linked
+  into the same binary.
+
+**Automatic debug symbols.** Whenever a profile's `sanitizers` array is
+non-empty, `-g` is unconditionally added to that profile's compile flags
+(`push_common` in [compiler.rs](../src/compiler.rs)), even in a
+`--release` build that would otherwise omit it — sanitizer stack traces are
+unreadable raw addresses without debug info. If this overrides a release
+profile's own choice, `Compiler::validate()` prints one warning to stderr
+before the build proceeds.
+
+**Flag ordering.** `-fsanitize=<type>` (and `-flto`, when `lto = true`) are
+appended to the compile command *before* the profile's own `extra_flags`, so
+a manifest can still layer on granular sub-flags such as
+`-fno-omit-frame-pointer` afterward:
+
+```toml
+[profile.c]
+sanitizers = ["address"]
+extra_flags = ["-fno-omit-frame-pointer"]
+```
+
+**Linking.** The exact same `-fsanitize=<type>` (and `-flto`) flags are
+also passed to the final link command (`Compiler::link_command`) for
+whichever language actually compiled the package's translation units — the
+sanitizer runtime has to be linked in, or the instrumented object files
+won't resolve. Library builds (which go through the archiver, not the
+linker) never receive these flags — archiving doesn't invoke clang at all.
 
 ### `[dependencies]`
 
