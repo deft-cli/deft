@@ -2,6 +2,34 @@
 
 All notable changes to this project.
 
+## [0.4.0] - 2026-07-01
+
+### Added
+
+- Native Clang sanitizer support: a `sanitizers` array in `[profile.c]` and
+  `[profile.cpp]` (e.g. `sanitizers = ["address", "undefined"]`) propagates
+  the matching `-fsanitize=address|thread|undefined|leak` flags to both the
+  compilation and linking phases of the build.
+- Strict compile-time safety matrix (`Compiler::validate`, run before any
+  compilation begins): aborts the build with a descriptive error if `lto`
+  is enabled together with the address or leak sanitizer, or if the thread
+  sanitizer is combined with the address or leak sanitizer — combinations
+  that clang accepts syntactically but that are unsafe or unsupported at
+  runtime.
+- Automatic `-g` (debug symbols) injection whenever a profile's `sanitizers`
+  array is non-empty, including under `--release`, so sanitizer stack
+  traces resolve to file/line info instead of raw addresses; a one-time
+  warning is printed when this overrides a release profile's own choice.
+- `lto` boolean field in `[profile.c]` and `[profile.cpp]` (default
+  `false`), emitting `-flto` at both compile and link time.
+
+### Changed
+
+- The manifest schema (`CProfile`/`CppProfile` in `src/manifest.rs`)
+  gained `sanitizers` and `lto` fields, both `#[serde(default)]`-backed —
+  an absent key parses to `[]`/`false`, so every v0.3.0 manifest continues
+  to parse and build unchanged.
+
 ## [0.3.0] - 2026-06-26
 
 ### Added
